@@ -1,0 +1,1430 @@
+/* The editor against a real D3D12 swap chain, without the game: a window that presents frames like the game does (clear,
+ * ExecuteCommandLists, Present), the editor DLL loaded with a small stand-in SDK (log, on, hook through MinHook, set_live,
+ * get_live, mod_folder), F8 pressed, the window resized and the editor closed and opened again; then, as a player would,
+ * Tab to the objects and to the fields, a field picked with the arrows, "1200" typed and applied with F9. It passes when
+ * every Present succeeds, the device is never removed, the editor reports it is drawing, its window shows on screen (with
+ * a screenshot), the change reached set_live, and Local Stats holds it. With D3D12, an "overlay" has a direct queue of
+ * its own on the same device and runs a list on it before and after the game's every frame (as RivaTuner, Steam, OBS or
+ * Overwolf can): the editor must draw on the swap chain's queue, not that one. And after the first frames, an "overlay"
+ * hooks Present's and Present1's code over the editor's as RivaTuner does (issue #5), calling past the editor: the editor
+ * must get in front of it again and still draw, the overlay still called, and the shared method table left alone (with
+ * a real RivaTuner in the process, RivaTuner is that overlay). Then the overlay takes its hook off, the code put back as
+ * it was before the editor: the editor must put its own hook back.
+ * Usage: overlay_test.exe <hellforge_editor.dll> [<screenshot.bmp> [<editor folder> [--full]]]
+ * --full requires the installed catalogue and runs the complete regression regardless of screenshot settings.
+ * HELLFORGE_EDITOR_TEST_D3D11=1: the window presents with Direct3D 11 instead, as the game does with --use-d3d11.
+ * HELLFORGE_EDITOR_TEST_NO_OVERLAY_QUEUE=1: no overlay queue (a real overlay, RivaTuner say, tried on its own).
+ * HELLFORGE_EDITOR_HDR=pq:200: the editor draws in HDR10 at 200 nits (the editor reads it), and its colours on screen must
+ * be PQ-encoded. */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <wchar.h>
+#include <math.h>
+#include <filesystem>
+#include <map>
+#include <vector>
+#include "MinHook.h"
+#include "hellforge_mod.h"
+#include "../json.h"
+
+struct HfMod { const HfApi* api; };
+static HfMod g_mod;
+static HfApi g_api;
+static HfEventCallback g_ready;
+static int g_drawing, g_hooked, g_lives, g_presetImports;
+static std::string g_presetSummary;
+static void* g_drawnQueue; /* the queue the editor says it draws on (D3D12) */
+static int g_again; /* times the editor got in front of an overlay that hooked over it */
+static int g_putBack; /* times the editor put its own hook back after an overlay put the code back as it was */
+static int g_modPage, g_modApplied; /* a mod's stratagem: its page made, its saved value sent to its own row */
+/* mod weapons' pages: the fields of the one owning every record and of the one owning its fire record (-1 no page), and
+ * whether the one sharing every record was left without one */
+static int g_goldFields = -1, g_swiftFields = -1, g_plainNoPage;
+static std::string g_modDir;
+static HfSession g_sessionNow; /* the co-op role the stand-in loader reports */
+static void Session(HfMod*, HfSession* out) { *out = g_sessionNow; }
+static uint32_t g_statsNow = HF_STATS_HOST; /* whose stats a joined game plays with (SDK 15) */
+static uint32_t StatsSource(HfMod*) { return g_statsNow; }
+static HfNotice g_noticeNow; /* HellForge's message for the player, as the stand-in loader reports it */
+static void Notice(HfMod*, HfNotice* out) { *out = g_noticeNow; }
+/* SDK 14, mod sync: the offer the stand-in loader reports, how often the editor read it, and the answers it sent */
+static HfSyncState g_syncNow;
+static HfSyncMod g_syncList[3];
+static int g_syncReads, g_syncOpens, g_syncAnswers[7], g_syncAlone, g_syncGone, g_editorOpens, g_syncWarnings;
+static char g_syncBlocked[65], g_syncTrusted[65], g_syncOpened[65];
+static int SyncState(HfMod*, HfSyncState* out)
+{
+    g_syncReads++;
+    uint32_t size = out->size;
+    memcpy(out, &g_syncNow, size < sizeof g_syncNow ? size : sizeof g_syncNow);
+    out->size = size;
+    return g_syncNow.state != HF_SYNC_NONE;
+}
+static int SyncMod(HfMod*, uint32_t index, HfSyncMod* out)
+{
+    if (g_syncNow.state == HF_SYNC_NONE || index >= g_syncNow.mods || index >= 3) return 0;
+    uint32_t size = out->size;
+    memcpy(out, &g_syncList[index], size < sizeof(HfSyncMod) ? size : sizeof(HfSyncMod));
+    out->size = size;
+    return 1;
+}
+static int SyncAnswer(HfMod*, uint32_t version, uint32_t answer, const char* id)
+{
+    if (g_syncNow.state == HF_SYNC_NONE || version != g_syncNow.version || answer < 1 || answer > 6) return 0;
+    g_syncAnswers[answer]++;
+    if (answer == HF_SYNC_BLOCK) snprintf(g_syncBlocked, sizeof g_syncBlocked, "%s", id ? id : "");
+    if (answer == HF_SYNC_TRUST) snprintf(g_syncTrusted, sizeof g_syncTrusted, "%s", id ? id : "");
+    if (answer == HF_SYNC_OPEN) snprintf(g_syncOpened, sizeof g_syncOpened, "%s", id ? id : "");
+    return 1;
+}
+/* the lobby browser (SDK 16): the backend's list as the editor reads it, and the asks it makes */
+static HfBrowseState g_browseNow = {sizeof(HfBrowseState)};
+static HfBrowseLobby g_browseList[3];
+static int g_browseRefreshes, g_browseJoins, g_browseQuick, g_browseAllowStrangers, g_lobbiesAlone, g_lobbiesGone;
+static char g_browseJoined[65];
+static int BrowseState(HfMod*, HfBrowseState* out)
+{
+    uint32_t size = out->size;
+    memcpy(out, &g_browseNow, size < sizeof g_browseNow ? size : sizeof g_browseNow);
+    out->size = size;
+    return 1;
+}
+static int BrowseLobby(HfMod*, uint32_t index, HfBrowseLobby* out)
+{
+    if (index >= g_browseNow.lobbies || index >= 3) return 0;
+    uint32_t size = out->size;
+    memcpy(out, &g_browseList[index], size < sizeof(HfBrowseLobby) ? size : sizeof(HfBrowseLobby));
+    out->size = size;
+    return 1;
+}
+static int BrowseAsk(HfMod*, uint32_t ask, const char* id)
+{
+    if (ask == HF_BROWSE_REFRESH) { g_browseRefreshes++; return 1; }
+    if (ask == HF_BROWSE_QUICK) { g_browseQuick++; return 1; }
+    if (ask == HF_BROWSE_ALLOW_STRANGERS) { g_browseAllowStrangers++; return 1; }
+    if (ask == HF_BROWSE_SHOWN || ask == HF_BROWSE_HIDDEN || ask == HF_BROWSE_SHOW_EDITED_STATS) return 1;
+    if (ask != HF_BROWSE_JOIN || id == NULL) return 0;
+    g_browseJoins++;
+    snprintf(g_browseJoined, sizeof g_browseJoined, "%s", id);
+    return 1;
+}
+static void SyncOffer(uint32_t state, uint32_t version, uint64_t bytes, uint64_t done)
+{
+    g_syncNow = {};
+    g_syncNow.size = sizeof g_syncNow; g_syncNow.state = state; g_syncNow.version = version; g_syncNow.mods = 3;
+    g_syncNow.bytes = bytes; g_syncNow.done = done;
+    snprintf(g_syncNow.host, sizeof g_syncNow.host, "Friend Host");
+}
+static double g_lastLive;
+static std::string g_folder, g_logsFolder;
+
+static void Log(HfMod*, const char* format, ...)
+{
+    char line[512];
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(line, sizeof line, format, arguments);
+    va_end(arguments);
+    printf("  mod: %s\n", line);
+    if (strstr(line, "drawing on the game's queue") || strstr(line, "drawing with Direct3D 11")) g_drawing = 1;
+    if (const char* at = strstr(line, "drawing on the game's queue ")) sscanf(at + strlen("drawing on the game's queue "), "%p", &g_drawnQueue);
+    if (strstr(line, "hooked the swap chain")) g_hooked = 1;
+    if (strstr(line, "the editor runs first again")) g_again++;
+    if (strstr(line, "the editor's hook is back in place")) g_putBack++;
+    if (strstr(line, "staged (APPLY writes them)"))
+    {
+        g_presetImports++;
+        g_presetSummary = line;
+    }
+    if (strstr(line, "A/MG-101 Heavy MG Sentry gets a page")) g_modPage = 1;
+    if (strstr(line, "AR-23G Liberator Gold gets a page") && strstr(line, "'s, ")) g_goldFields = atoi(strstr(line, "'s, ") + 4);
+    if (strstr(line, "AR-23S Liberator Swift gets a page") && strstr(line, "'s, ")) g_swiftFields = atoi(strstr(line, "'s, ") + 4);
+    if (strstr(line, "test/mod/liberator_plain has no page: it shares every record")) g_plainNoPage = 1;
+    if (strstr(line, "editor: mod sync") && strstr(line, "the dialog opens")) g_syncOpens++;
+    if (strstr(line, "the mod sync prompt shows over the game")) g_syncAlone++;
+    if (strstr(line, "the mod sync prompt goes")) g_syncGone++;
+    if (strstr(line, "the trust warning for")) g_syncWarnings++;
+    if (strstr(line, "the lobby browser shows over the game")) g_lobbiesAlone++;
+    if (strstr(line, "the lobby browser goes")) g_lobbiesGone++;
+    if (strstr(line, "sound: the editor opens")) g_editorOpens++;
+}
+static const char* Build() { return "25480438"; }
+static const char* ModFolder(HfMod*) { return g_folder.c_str(); }
+static int On(HfMod* mod, HfEvent event, HfEventCallback callback, void* user) { if (event == HF_EVENT_ENTITIES_READY) g_ready = callback; return 0; }
+/* the originals the editor got, by target (the test's "overlay" calls past the editor with them) */
+static struct { uintptr_t target; void** original; } g_hooks[64];
+static int g_hookCount;
+static int Hook(HfMod*, uintptr_t target, void* detour, void** original)
+{
+    if (MH_CreateHook((void*)target, detour, original) != MH_OK) return 1;
+    if (g_hookCount < 64) { g_hooks[g_hookCount].target = target; g_hooks[g_hookCount++].original = original; }
+    return MH_EnableHook((void*)target) == MH_OK ? 0 : 1;
+}
+static void* OriginalOf(void* target) { for (int i = 0; i < g_hookCount; i++) if (g_hooks[i].target == (uintptr_t)target) return *g_hooks[i].original; return NULL; }
+/* An overlay that hooks Present's and Present1's code after the editor as RivaTuner does: its own jump written over the
+ * one at the start of the code (to a stub of its own within 2 GB, which jumps on to its detour), its detour calling the
+ * code as it was before the editor, past the editor's detour. */
+typedef HRESULT(STDMETHODCALLTYPE* PresentCall)(IDXGISwapChain3*, UINT, UINT);
+typedef HRESULT(STDMETHODCALLTYPE* Present1Call)(IDXGISwapChain3*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+static PresentCall g_overlayPresentNext;
+static Present1Call g_overlayPresent1Next;
+static int g_overlayPresents;
+static bool g_scRgb;
+
+static double LinearSrgb(int channel)
+{
+    double c = channel / 255.0;
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+static float HalfToFloat(uint16_t bits)
+{
+    int exponent = (bits >> 10) & 31;
+    if (exponent == 31) return NAN;
+    int fraction = bits & 1023;
+    float value = exponent ? ldexpf((float)(fraction + 1024), exponent - 25) : ldexpf((float)fraction, -24);
+    return (bits & 0x8000) ? -value : value;
+}
+
+/* Read the D3D11 buffer after the editor has painted it, with that buffer still current. */
+static bool CheckScRgbAccent(IDXGISwapChain3* chain)
+{
+    ID3D11Texture2D* back = nullptr;
+    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&back)))) return false;
+    D3D11_TEXTURE2D_DESC desc{};
+    back->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) { back->Release(); return false; }
+
+    ID3D11Device* device = nullptr;
+    back->GetDevice(&device);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    ID3D11Texture2D* readback = nullptr;
+    bool matched = false;
+    if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &readback)))
+    {
+        ID3D11DeviceContext* context = nullptr;
+        device->GetImmediateContext(&context);
+        context->CopyResource(readback, back);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped)))
+        {
+            /* The selected tab has an opaque GOLD underline (255, 199, 44).
+             * After sRGB decoding, 200 nits reference white scales scRGB by 200/80. */
+            const float scale = 200.0f / 80.0f;
+            const float green = (float)LinearSrgb(199) * scale, blue = (float)LinearSrgb(44) * scale;
+            const auto* pixels = static_cast<const BYTE*>(mapped.pData);
+            for (UINT y = 0; y < desc.Height && !matched; ++y)
+            {
+                const auto* row = reinterpret_cast<const uint16_t*>(pixels + y * mapped.RowPitch);
+                for (UINT x = 0; x < desc.Width; ++x)
+                {
+                    const uint16_t* rgba = row + 4 * x;
+                    float r = HalfToFloat(rgba[0]), g = HalfToFloat(rgba[1]), b = HalfToFloat(rgba[2]);
+                    if (fabsf(r - scale) < 0.01f && fabsf(g - green) < 0.01f && fabsf(b - blue) < 0.01f)
+                    {
+                        printf("PASS scRGB FP16: 200 nits accent linear RGB (%.3f, %.3f, %.3f)\n", r, g, b);
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            context->Unmap(readback, 0);
+        }
+        context->Release();
+        readback->Release();
+    }
+    device->Release();
+    back->Release();
+    return matched;
+}
+
+static HRESULT STDMETHODCALLTYPE OverlayPresent(IDXGISwapChain3* chain, UINT interval, UINT flags)
+{ g_overlayPresents++; return g_overlayPresentNext(chain, interval, flags); }
+static HRESULT STDMETHODCALLTYPE OverlayPresent1(IDXGISwapChain3* chain, UINT interval, UINT flags, const DXGI_PRESENT_PARAMETERS* p)
+{ g_overlayPresents++; return g_overlayPresent1Next(chain, interval, flags, p); }
+static bool OverlayHooks(void* code, void* detour)
+{
+    uint8_t* stub = NULL;
+    for (uintptr_t at = ((uintptr_t)code & ~(uintptr_t)0xFFFF) - 0x10000; stub == NULL && at > (uintptr_t)code - 0x70000000; at -= 0x10000)
+        stub = (uint8_t*)VirtualAlloc((void*)at, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (stub == NULL) return false; /* its jump goes over the one there (the editor's, or a real overlay's), five bytes */
+    stub[0] = 0xFF; stub[1] = 0x25; memset(stub + 2, 0, 4); memcpy(stub + 6, &detour, 8);
+    uint8_t jump[5] = {0xE9};
+    int32_t rel = (int32_t)(stub - ((uint8_t*)code + 5));
+    memcpy(jump + 1, &rel, 4);
+    DWORD protect;
+    VirtualProtect(code, 5, PAGE_EXECUTE_READWRITE, &protect);
+    memcpy(code, jump, 5);
+    VirtualProtect(code, 5, protect, &protect);
+    FlushInstructionCache(GetCurrentProcess(), code, 5);
+    return true;
+}
+static int g_resets;
+static int g_refuseCapacity; /* the big preset's test: magazine capacities refused (its errors) */
+static const char* LastLog(HfMod*) { return "set_live: test: magazine capacities are refused here"; }
+static const char* LogsFolder(HfMod*) { return g_logsFolder.c_str(); }
+static double g_modCooldown = -2; /* the mod stratagem's cooldown as the editor last set it (-1: its edit undone) */
+static int SetLive(HfMod*, HfRef target, const HfField* field, const HfValue* value, uint32_t flags)
+{
+    if (g_refuseCapacity && value && field && field->offset == 136) return 0;
+    if (target == 150 && value && value->number == 150 && field && !strcmp(field->component, "StratagemDefinition")) g_modApplied++;
+    if (target == 150 && field && !strcmp(field->component, "StratagemDefinition")) g_modCooldown = value ? value->number : -1;
+    g_lives++;
+    if (value) g_lastLive = value->number;
+    else if (flags & HF_LIVE_BASE) g_resets++;
+    return HF_APPLIES_RESPAWN;
+}
+/* every field holds 640, its base 600; whole-number fields (references among them) hold their base. With
+ * HELLFORGE_EDITOR_TEST_VIEW=mods (the MODS view's screenshot), mods hold some: a Lua mod a damage row's armour
+ * penetration (+12, 9 where an editor change holds 10), a code mod the projectile settings' velocity (+32). */
+static bool g_modsView, g_enemiesView; /* HELLFORGE_EDITOR_TEST_VIEW=enemies: a screenshot of an enemy's category at the end */
+/* HELLFORGE_EDITOR_TEST_LIVE_US=<n>: each get_live takes n microseconds, as a slow lookup in the mod loader can */
+static LONGLONG g_liveCostUs;
+static int GetLive(HfMod*, HfRef, const HfField* field, HfLiveValue* out)
+{
+    if (g_liveCostUs > 0)
+    {
+        LARGE_INTEGER f, start, now;
+        QueryPerformanceFrequency(&f); QueryPerformanceCounter(&start);
+        do QueryPerformanceCounter(&now); while ((now.QuadPart - start.QuadPart) * 1000000 / f.QuadPart < g_liveCostUs);
+    }
+    out->now.type = out->base.type = field->type;
+    out->now.number = field->type == HF_TYPE_U32 ? 600 : 640;
+    out->base.number = 600;
+    out->mod = NULL;
+    if (g_modsView && !strcmp(field->component, "DamageInfo") && field->offset == 12)
+    { out->mod = "lua.mods-azura-railgun_repenetrated"; out->base.number = 9; out->now.number = 9; }
+    if (g_modsView && !strcmp(field->component, "ProjectileSettings") && field->offset == 32)
+    { out->mod = "skyeshade.vanilla-plus"; out->base.number = 1200; out->now.number = 1200; }
+    return HF_APPLIES_RESPAWN;
+}
+/* SDK 10, mods: two HellForge mods and a Lua mod */
+static int Mods(HfMod*, uint32_t index, HfModInfo* out)
+{
+    static const HfModInfo list[] = {
+        {sizeof(HfModInfo), HF_MOD_CODE, "skyeshade.vanilla-plus", "", "", 1},
+        {sizeof(HfModInfo), HF_MOD_STATS, "skyeshade.hell-forge", "", "", 1},
+        {sizeof(HfModInfo), HF_MOD_EDITOR, "hellforge.editor", "", "", 1},
+        {sizeof(HfModInfo), HF_MOD_LUA, "lua.mods-azura-railgun_repenetrated", "", "mods/azura/railgun_repenetrated", 1}};
+    if (index >= sizeof list / sizeof list[0]) return 0;
+    *out = list[index];
+    return 1;
+}
+/* fields applied at boot (entity deltas, say): every one holds 1.5 (whole ones 7), its base 1 */
+static int g_stats;
+static int GetStat(HfMod*, const HfStat* stat, HfLiveValue* out)
+{
+    g_stats++;
+    out->now.type = out->base.type = stat->type;
+    out->now.number = stat->type == HF_TYPE_F32 ? 1.5 : 7;
+    out->base.number = 1;
+    out->mod = NULL;
+    return 1;
+}
+/* A mod's content, as the loader lists it: a copy of the A/MG-43 sentry's stratagem (type 150) dropping a copy of the
+ * sentry (its own designation) that fires a copy of its round dealing a copy of its damage. */
+static const HfEditorEntity kModEntities[] = {{0xABCDull, 0x37CDE43876BA26BBull}, {0, 0}};
+static uint32_t g_extraWeapons;
+static const uint64_t kLiberator = 0x968211C0033DCE64ull, kWeaponOwnsAll = 0xBEEF01, kWeaponSharesAll = 0xBEEF02, kWeaponOwnsFire = 0xBEEF03;
+/* An entity's record of a component, as the loader answers: a vanilla entity's and the sentry copy's (own_all) are
+ * their own; of the Liberator copies, the first owns every record (HfWeapon.own_all), the second none, the third only
+ * its ProjectileWeapon record (a projectile of its own). A copy's shared record is refused (0), as the loader does. */
+static uintptr_t ComponentRecord(const char* component, uint64_t resource, uint32_t* stride)
+{
+    if (stride) *stride = 64;
+    if (resource == kWeaponSharesAll || (resource == kWeaponOwnsFire && strcmp(component, "ProjectileWeaponComponentData") != 0)) return 0;
+    return (uintptr_t)(resource * 0x100 + strlen(component)) | 1;
+}
+static int Content(HfMod*, uint32_t index, HfContent* out)
+{
+    HfContent c = {};
+    c.size = sizeof c;
+    c.mod = "test.mod";
+    c.folder = g_modDir.c_str();
+    switch (index)
+    {
+    case 0: c.kind = HF_KIND_STRATAGEM; c.id = 150; c.base = 121; c.name = "test/mod/hmg"; c.title = "Heavy MG Sentry";
+        c.icon = "test/mod/icons/hmg"; c.editor_like = 121; c.editor_entities = kModEntities; break;
+    case 1: c.kind = HF_KIND_ENTITY; c.id = 0xABCD; c.base = 0x37CDE43876BA26BBull; c.name = "test/mod/hmg_entity"; c.designation = "A/MG-101"; break;
+    case 2: c.kind = HF_KIND_PROJECTILE; c.id = 400; c.base = 148; c.link = 700; c.name = "test/mod/round"; break;
+    case 3: c.kind = HF_KIND_DAMAGE; c.id = 700; c.base = 125; c.name = "test/mod/damage"; break;
+    /* HELLFORGE_EDITOR_TEST_WEAPONS=<n>: n more Liberator copies owning every record, as a large weapon pack (the editor
+     * logs how long its mod pages took) */
+    case 4: case 5: case 6: /* three Liberator copies (ComponentRecord: what each owns) */
+        c.kind = HF_KIND_ITEM; c.id = 0x1110 + index; c.base = HF_ITEM_AR23_LIBERATOR; c.base_entity = kLiberator;
+        c.entity = index == 4 ? kWeaponOwnsAll : index == 5 ? kWeaponSharesAll : kWeaponOwnsFire;
+        c.name = index == 4 ? "test/mod/liberator_gold" : index == 5 ? "test/mod/liberator_plain" : "test/mod/liberator_swift";
+        c.title = index == 4 ? "Liberator Gold" : index == 5 ? "Liberator Plain" : "Liberator Swift";
+        c.designation = index == 4 ? "AR-23G" : index == 5 ? "AR-23P" : "AR-23S";
+        break;
+    default:
+        if (index - 7 >= g_extraWeapons) return 0;
+        {
+            static char names[512][32], designations[512][8], titles[512][16];
+            uint32_t n = index - 7;
+            snprintf(names[n], sizeof names[n], "test/mod/stress_%03u", n + 1);
+            snprintf(designations[n], sizeof designations[n], "T-%03u", n + 1);
+            snprintf(titles[n], sizeof titles[n], "Test %03u", n + 1);
+            c.kind = HF_KIND_ITEM; c.id = 0x2000 + n; c.base = HF_ITEM_AR23_LIBERATOR; c.base_entity = kLiberator; c.entity = 0xC0DE0000ull + n;
+            c.name = names[n]; c.designation = designations[n]; c.title = titles[n];
+        }
+        break;
+    }
+    *out = c;
+    return 1;
+}
+
+/* Fixture inputs are sent synchronously. Discard desktop input queued for its window. */
+static void PumpMessages(HWND window)
+{
+    MSG message;
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+    {
+        const UINT id = message.message;
+        if (message.hwnd == window &&
+            ((id >= WM_KEYFIRST && id <= WM_KEYLAST) || (id >= WM_MOUSEFIRST && id <= WM_MOUSELAST) ||
+             id == WM_MOUSELEAVE || id == WM_MOUSEHOVER || id == WM_NCMOUSEMOVE ||
+             id == WM_NCMOUSELEAVE || id == WM_NCMOUSEHOVER))
+            continue;
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+
+static void Key(HWND window, WPARAM key)
+{
+    // ImGui queries the calling thread's modifier state even for synchronously sent key messages.
+    BYTE keyboard[256] = {};
+    if (!SetKeyboardState(keyboard)) { puts("FAIL could not reset the fixture thread's keyboard state"); exit(1); }
+    SendMessageW(window, WM_KEYDOWN, key, 0);
+    SendMessageW(window, WM_KEYUP, key, 0xC0000000);
+}
+static void Type(HWND window, const char* text) { for (; *text; text++) SendMessageW(window, WM_CHAR, (WPARAM)*text, 0); }
+static std::wstring ShotPath(const wchar_t* path, const wchar_t* suffix)
+{
+    if (!*path) return {};
+    std::wstring name(path);
+    size_t dot = name.find_last_of(L'.'), slash = name.find_last_of(L"\\/");
+    if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash)) name.resize(dot);
+    return name + suffix;
+}
+
+static bool IsClearPixel(const BYTE* pixel, const BYTE* background)
+{
+    return abs(pixel[0] - background[0]) <= 4 && abs(pixel[1] - background[1]) <= 4 && abs(pixel[2] - background[2]) <= 4;
+}
+
+static DWORD BitmapStride(UINT width) { return (width * 3 + 3) & ~3u; }
+
+/* Capture this fixture's client area, even when another window covers it. */
+static std::vector<BYTE> CaptureWindow(HWND window, UINT width, UINT height)
+{
+    std::vector<BYTE> pixels;
+    HDC screen = GetDC(window);
+    if (!screen) return pixels;
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = memory ? CreateCompatibleBitmap(screen, (int)width, (int)height) : nullptr;
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof info.bmiHeader, (LONG)width, -(LONG)height, 1, 24, BI_RGB};
+    if (bitmap)
+    {
+        HGDIOBJ old = SelectObject(memory, bitmap);
+        if (old)
+        {
+            BOOL captured = PrintWindow(window, memory, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+            SelectObject(memory, old);
+            if (captured)
+            {
+                pixels.resize(BitmapStride(width) * height);
+                if (GetDIBits(screen, bitmap, 0, height, pixels.data(), &info, DIB_RGB_COLORS) != (int)height)
+                    pixels.clear();
+            }
+        }
+        DeleteObject(bitmap);
+    }
+    if (memory) DeleteDC(memory);
+    ReleaseDC(window, screen);
+    return pixels;
+}
+
+static bool WriteBitmap(const std::wstring& path, UINT width, UINT height, const std::vector<BYTE>& pixels)
+{
+    std::filesystem::path temp(path);
+    temp.replace_filename(L".hf-overlay-" + std::to_wstring(GetCurrentProcessId()) + L".tmp");
+    HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        const DWORD error = GetLastError();
+        printf("FAIL could not stage BMP %s (Win32 error %lu)\n", hfjson::Utf8(path).c_str(), error);
+        return false;
+    }
+    const auto write = [file](const void* data, DWORD size) -> DWORD {
+        DWORD written = 0;
+        if (!WriteFile(file, data, size, &written, nullptr)) return GetLastError();
+        return written == size ? ERROR_SUCCESS : ERROR_WRITE_FAULT;
+    };
+    const BITMAPINFOHEADER info = {sizeof info, (LONG)width, -(LONG)height, 1, 24, BI_RGB};
+    const DWORD size = (DWORD)pixels.size(), offset = sizeof(BITMAPFILEHEADER) + sizeof info;
+    const BITMAPFILEHEADER header = {0x4D42, offset + size, 0, 0, offset};
+    DWORD error = write(&header, sizeof header);
+    if (error == ERROR_SUCCESS) error = write(&info, sizeof info);
+    if (error == ERROR_SUCCESS) error = write(pixels.data(), size);
+    if (!CloseHandle(file) && error == ERROR_SUCCESS) error = GetLastError();
+    if (error == ERROR_SUCCESS && !MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        error = GetLastError();
+    if (error == ERROR_SUCCESS) return true;
+    DeleteFileW(temp.c_str());
+    printf("FAIL could not save BMP %s (Win32 error %lu)\n", hfjson::Utf8(path).c_str(), error);
+    return false;
+}
+
+static int ChangedPixels(const std::vector<BYTE>& pixels, const std::vector<BYTE>& background,
+    UINT width, UINT height, const RECT& area)
+{
+    if (pixels.empty() || pixels.size() != background.size()) return 0;
+    int drawn = 0;
+    const DWORD row = BitmapStride(width);
+    for (LONG y = area.top; y < area.bottom && y < (LONG)height; y++)
+        for (LONG x = area.left; x < area.right && x < (LONG)width; x++)
+        {
+            const size_t offset = y * row + x * 3;
+            if (!IsClearPixel(pixels.data() + offset, background.data() + offset)) drawn++;
+        }
+    return drawn;
+}
+
+static bool CopyInto(const std::wstring& from, const std::wstring& folder, const std::wstring& name)
+{
+    return CopyFileW((from + L"\\" + name).c_str(), (folder + L"\\" + name).c_str(), FALSE) != 0;
+}
+
+static bool CopyCatalogue(const std::wstring& source, const std::wstring& folder)
+{
+    if (!CopyInto(source, folder, L"editor-catalog.json"))
+    {
+        printf("FAIL could not copy editor-catalog.json (Win32 error %lu)\n", GetLastError());
+        return false;
+    }
+    std::string bytes;
+    hfjson::Value index;
+    if (!hfjson::ReadFile(folder + L"\\editor-catalog.json", &bytes) || !hfjson::Parse(bytes, &index, nullptr))
+    {
+        puts("FAIL the copied editor-catalog.json could not be read as JSON");
+        return false;
+    }
+    const hfjson::Value* files = index.Find("files", hfjson::Value::Array);
+    if (index.GetString("build") != "25480438" || !files || files->items.empty())
+    {
+        puts("FAIL editor-catalog.json must describe build 25480438 and list its catalogue shards");
+        return false;
+    }
+    for (const auto& part : files->items)
+    {
+        const auto& name = part.Str();
+        if (part.kind != hfjson::Value::String || name.rfind("editor-catalog-", 0) != 0 || name.find_first_of("\\/:") != std::string::npos)
+        {
+            puts("FAIL editor-catalog.json lists an invalid catalogue shard name");
+            return false;
+        }
+        if (!CopyInto(source, folder, hfjson::Wide(name)))
+        {
+            printf("FAIL could not copy %s (Win32 error %lu)\n", name.c_str(), GetLastError());
+            return false;
+        }
+    }
+    printf("  official catalogue 25480438: copied %zu shards\n", files->items.size());
+    return true;
+}
+
+static bool HasPresetSample(const hfjson::Value& root)
+{
+    const auto* fields = root.Find("fields", hfjson::Value::Array);
+    if (root.GetString("format") != "hd2r-editor-preset" || !fields) return false;
+    const hfjson::Value* damage = nullptr;
+    for (const auto& field : fields->items)
+    {
+        if (field.GetString("key") != "pw|AR-11 Arbitrator|damage.durable_damage") continue;
+        if (damage) return false;
+        damage = field.Find("value", hfjson::Value::Number);
+        if (!damage) return false;
+    }
+    return damage && damage->AsNumber() == 41;
+}
+
+static void* Record(HfMod*, HfRef, const char*, uint32_t, uint32_t size) /* a Liberator record holding 640 rpm */
+{
+    static HfProjectileWeapon weapon;
+    weapon.fire_rate[1] = 640.0f;
+    return size == sizeof weapon ? &weapon : NULL;
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc < 2 || argc > 5 || (argc == 5 && wcscmp(argv[4], L"--full")))
+    {
+        puts("usage: overlay_test.exe <hellforge_editor.dll> [<screenshot.bmp> [<editor folder> [--full]]]");
+        return 2;
+    }
+    const bool full = argc == 5;
+    const wchar_t* shot = argc > 2 ? argv[2] : L"";
+    const char* scale = full ? nullptr : getenv("HELLFORGE_EDITOR_TEST_SCALE");
+    SetProcessDPIAware(); /* the screenshot in real pixels, not a scaled copy */
+    MH_Initialize();
+    g_api.version = HF_MOD_SDK_VERSION; g_api.size = sizeof g_api;
+    g_api.log = Log; g_api.build_id = Build; g_api.on = On; g_api.hook = Hook; g_api.set_live = SetLive; g_api.record = Record; g_api.mod_folder = ModFolder;
+    g_api.get_live = GetLive;
+    g_api.last_log = LastLog; g_api.logs_folder = LogsFolder; g_api.get_stat = GetStat; g_api.session = Session; g_api.stats_source = StatsSource;
+    g_api.content = Content;
+    g_api.component_record = ComponentRecord;
+    const char* extraWeapons = full ? nullptr : getenv("HELLFORGE_EDITOR_TEST_WEAPONS");
+    g_extraWeapons = extraWeapons ? (uint32_t)atoi(extraWeapons) : 0;
+    if (g_extraWeapons > 512) g_extraWeapons = 512;
+    g_api.mods = Mods;
+    g_api.notice = Notice;
+    g_api.sync_state = SyncState; g_api.sync_mod = SyncMod; g_api.sync_answer = SyncAnswer;
+    g_api.browse_state = BrowseState; g_api.browse_lobby = BrowseLobby; g_api.browse_ask = BrowseAsk;
+    const char* view = full ? nullptr : getenv("HELLFORGE_EDITOR_TEST_VIEW");
+    g_modsView = view && !strcmp(view, "mods");
+    g_enemiesView = view && !strcmp(view, "enemies");
+    /* the editor's folder in a mods folder of the test's own: its catalogue and icons, and Local Stats next to it */
+    wchar_t temp[MAX_PATH];
+    DWORD length = GetTempPathW(MAX_PATH, temp);
+    if (!length || length >= MAX_PATH) { puts("FAIL could not find the fixture's temporary directory"); return 1; }
+    const std::wstring mods = std::wstring(temp, length) + L"hellforge-overlay-test-" + std::to_wstring(GetCurrentProcessId());
+    const std::wstring folder = mods + L"\\hellforge-editor";
+    const std::wstring stats = mods + L"\\zz.local.stats\\hellforge-stats.json";
+    g_folder = hfjson::Utf8(folder);
+    if (g_folder.empty()) { puts("FAIL the fixture directory cannot be encoded for the editor SDK"); return 1; }
+    const bool catalogued = argc > 3;
+    if (catalogued)
+    {
+        if (!CreateDirectoryW(mods.c_str(), NULL) || !CreateDirectoryW(folder.c_str(), NULL))
+        {
+            printf("FAIL could not create the isolated fixture directory (Win32 error %lu)\n", GetLastError());
+            return 1;
+        }
+        if (!CopyCatalogue(argv[3], folder)) return 1;
+        CopyInto(argv[3], folder, L"game-icons.bin");
+        CopyInto(argv[3], folder, L"fs-sinclair.ttf");
+        CopyInto(argv[3], folder, L"fs-sinclair-medium.ttf");
+        /* the mod: its data names its icon's image (a 4 x 4 BMP here); a cooldown the editor saved for its stratagem */
+        const std::wstring modDir = mods + L"\\test-mod";
+        g_modDir = hfjson::Utf8(modDir);
+        CreateDirectoryW(modDir.c_str(), NULL);
+        if (FILE* file = _wfopen((modDir + L"\\hellforge-data.json").c_str(), L"wb"))
+        {
+            fputs("{\"format\":1,\"patches\":[{\"archives\":[\"007e093ca718ca1a\"],\"resources\":[{\"icon\":\"icon.bmp\",\"name\":\"test/mod/icons/hmg\"}]}]}", file);
+            fclose(file);
+        }
+        if (FILE* file = _wfopen((modDir + L"\\icon.bmp").c_str(), L"wb"))
+        {
+            /* the stratagem pack's format: red the category layer, green the white one (BMP rows are blue, green, red) */
+            BYTE pixels[4 * 4 * 3];
+            for (int i = 0; i < 16; i++)
+            {
+                bool inner = (i % 4 == 1 || i % 4 == 2) && (i / 4 == 1 || i / 4 == 2);
+                pixels[3 * i] = 0; pixels[3 * i + 1] = inner ? 255 : 0; pixels[3 * i + 2] = inner ? 0 : 255;
+            }
+            BITMAPINFOHEADER header = {sizeof header, 4, 4, 1, 24, BI_RGB};
+            BITMAPFILEHEADER bmp = {0x4D42, (DWORD)(sizeof bmp + sizeof header + sizeof pixels), 0, 0, (DWORD)(sizeof bmp + sizeof header)};
+            fwrite(&bmp, sizeof bmp, 1, file); fwrite(&header, sizeof header, 1, file); fwrite(pixels, sizeof pixels, 1, file);
+            fclose(file);
+        }
+        if (FILE* file = _wfopen((folder + L"\\mod-stats.json").c_str(), L"wb"))
+        {
+            fputs("{\"format\":1,\"mod:test/mod/hmg\":{\"test/mod/hmg\":{\"stratagem.cooldown\":150}}}", file);
+            fclose(file);
+        }
+        /* the Patriot's left gun swapped to the Emancipator's (mounted weapon 2), its Mounted Weapons and left gun open */
+        if (FILE* file = _wfopen((folder + L"\\editor-settings.json").c_str(), L"wb"))
+        {
+            /* HELLFORGE_EDITOR_TEST_SCALE=1.5: the screenshots at that UI scale (the category list then outgrows its panel) */
+            fprintf(file, "{%s%s%s\"open\":[\"stratagems/EXO-45 Patriot Exosuit|c|mounts\",\"stratagems/EXO-45 Patriot Exosuit|c|mount:EXO-45 Patriot Exosuit / left_gun\"],"
+                  "\"mounts\":{\"EXO-45 Patriot Exosuit|mount.slot_0\":2}}", scale ? "\"ui_scale\":" : "", scale ? scale : "", scale ? "," : "");
+            fclose(file);
+        }
+    }
+    g_mod.api = &g_api;
+
+    WNDCLASSEXW type = {sizeof type, 0, DefWindowProcW, 0, 0, GetModuleHandleW(NULL), NULL, LoadCursor(NULL, IDC_ARROW), NULL, NULL, L"OverlayTest", NULL};
+    RegisterClassExW(&type);
+    HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, type.lpszClassName, L"HellForge overlay test", WS_POPUP | WS_VISIBLE, 0, 0, 1280, 720, NULL, NULL, type.hInstance, NULL);
+    ID3D12Device* device = NULL; ID3D12CommandQueue* queue = NULL; IDXGIFactory2* factory; IDXGISwapChain1* chain1; IDXGISwapChain3* chain;
+    const bool d3d11 = getenv("HELLFORGE_EDITOR_TEST_D3D11") != NULL;
+    const char* hdr = getenv("HELLFORGE_EDITOR_HDR");
+    g_scRgb = hdr && strncmp(hdr, "scrgb", 5) == 0;
+    const bool checkScRgb = d3d11 && hdr && strcmp(hdr, "scrgb:200") == 0;
+    ID3D11Device* device11 = NULL; ID3D11DeviceContext* context11 = NULL;
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    DXGI_SWAP_CHAIN_DESC1 desc = {};
+    desc.Width = 1280; desc.Height = 720; desc.SampleDesc.Count = 1;
+    desc.Format = g_scRgb ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; desc.BufferCount = 3;
+    // The scRGB probe samples the current buffer after a non-sequencing Present.
+    desc.SwapEffect = checkScRgb ? DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL : DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    if (d3d11)
+    {
+        if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device11, NULL, &context11)) ||
+            FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory->CreateSwapChainForHwnd(device11, window, &desc, NULL, NULL, &chain1)) ||
+            FAILED(chain1->QueryInterface(IID_PPV_ARGS(&chain))))
+        { puts("FAIL no D3D11 swap chain on this machine"); return 1; }
+        puts("  the window presents with Direct3D 11");
+    }
+    else if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))) || FAILED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue))) ||
+        FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory->CreateSwapChainForHwnd(queue, window, &desc, NULL, NULL, &chain1)) ||
+        FAILED(chain1->QueryInterface(IID_PPV_ARGS(&chain))))
+    { puts("FAIL no D3D12 swap chain on this machine"); return 1; }
+
+    /* the code of Present and Present1, as the swap chain's method table gives it before the editor is in */
+    void* presentCode = (*(void***)chain)[8];
+    void* present1Code = (*(void***)chain)[22];
+    uint8_t presentBefore[8]; /* Present's first bytes as they are before the editor */
+    memcpy(presentBefore, presentCode, 8);
+    HMODULE editor = LoadLibraryW(argv[1]);
+    typedef int (*Init)(const HfApi*, HfMod*);
+    Init init = editor ? (Init)(void*)GetProcAddress(editor, "hellforge_mod_init") : NULL;
+    if (!init || init(&g_api, &g_mod) != 0 || !g_ready) { puts("FAIL the editor did not initialize"); return 1; }
+    g_ready(&g_mod, HF_EVENT_ENTITIES_READY, NULL);
+    if (catalogued)
+    {
+        printf("  mod stratagem: page %s, its saved cooldown sent to its own row %d time(s)\n", g_modPage ? "made" : "NOT made", g_modApplied);
+        if (!g_modPage || g_modApplied != 1) { puts("FAIL a mod's stratagem got no page, or its saved value did not reach its own row"); return 1; }
+        printf("  mod weapons: own_all %d field(s), its own fire record %d, shares everything: %s\n", g_goldFields, g_swiftFields,
+            g_plainNoPage ? "no page" : "a page");
+        /* In catalogue build 25480438, the Liberator has 16 WeaponData, 3 ProjectileWeaponData and 5 armory rows
+         * on owned records. Stats snapshot reads and choices stay off the copies. */
+        if (g_goldFields != 24 || g_swiftFields != 3 || !g_plainNoPage)
+        { puts("FAIL a mod weapon's page is not the fields of the records it owns"); return 1; }
+    }
+
+    ID3D12CommandAllocator* allocator = NULL; ID3D12GraphicsCommandList* list = NULL; ID3D12Fence* fence = NULL; ID3D12DescriptorHeap* rtvHeap = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC rtv = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    if (!d3d11)
+    {
+        device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+        device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, IID_PPV_ARGS(&list));
+        list->Close();
+        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&rtvHeap));
+    }
+    /* the overlay's own queue and an (empty) list it runs */
+    ID3D12CommandQueue* overlayQueue = NULL; ID3D12CommandAllocator* overlayAllocator = NULL; ID3D12GraphicsCommandList* overlayList = NULL;
+    if (!d3d11 && (full || !getenv("HELLFORGE_EDITOR_TEST_NO_OVERLAY_QUEUE")) && (FAILED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&overlayQueue))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&overlayAllocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, overlayAllocator, NULL, IID_PPV_ARGS(&overlayList)))))
+    { puts("FAIL no second queue for the overlay"); return 1; }
+    if (overlayList) overlayList->Close();
+    auto overlay = [&]() { if (overlayQueue) { ID3D12CommandList* lists[] = {overlayList}; overlayQueue->ExecuteCommandLists(1, lists); } };
+    HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    UINT64 value = 0;
+    int failures = 0;
+    UINT width = 1280, height = 720;
+    const auto screenshot = [&](const std::wstring& path) {
+        auto pixels = CaptureWindow(window, width, height);
+        if (pixels.empty())
+        {
+            printf("FAIL could not capture the isolated test window (%s)\n", path.empty() ? "background" : hfjson::Utf8(path).c_str());
+            failures++;
+        }
+        else if (!path.empty() && !WriteBitmap(path, width, height, pixels)) failures++;
+        return pixels;
+    };
+    std::vector<BYTE> background;
+    ULONGLONG noticeAt = 0;
+    const bool rivaTuner = GetModuleHandleW(L"RTSSHooks64.dll") != NULL; /* a real RivaTuner hooks this process too */
+    for (int frame = 0; frame < 420; frame++)
+    {
+        PumpMessages(window);
+        /* an overlay hooks Present's and Present1's code over the editor's after it has started, and never calls the
+         * editor's detour (RivaTuner coming in late, issue #5); the editor must get in front of it again. Where a real
+         * RivaTuner is in the process it is that overlay (it hooks over the editor on the first frames), and the test's
+         * own is left out: two overlays writing over each other's jump (RivaTuner takes its hook off around each call and
+         * puts it back after) is a fight the test would make, not what it checks */
+        if (frame == 10 && rivaTuner) printf("  overlay: RivaTuner is in the process; it is the overlay that hooks over the editor\n");
+        /* later the overlay takes its hook off as RivaTuner does: Present's code put back as it was before the editor
+         * (eight bytes at once); the editor must put its own hook back */
+        if (frame == 120 && !rivaTuner)
+        {
+            LONG64 before, now;
+            memcpy(&before, presentBefore, 8);
+            memcpy(&now, presentCode, 8);
+            DWORD protect;
+            VirtualProtect(presentCode, 8, PAGE_EXECUTE_READWRITE, &protect);
+            InterlockedCompareExchange64((volatile LONG64*)presentCode, before, now);
+            VirtualProtect(presentCode, 8, protect, &protect);
+            FlushInstructionCache(GetCurrentProcess(), presentCode, 8);
+            printf("  overlay: Present's code put back as it was before the editor, as RivaTuner does when it takes its hook off\n");
+        }
+        if (frame == 10 && !rivaTuner)
+        {
+            g_overlayPresentNext = (PresentCall)OriginalOf(presentCode);
+            g_overlayPresent1Next = (Present1Call)OriginalOf(present1Code);
+            bool cut = g_overlayPresentNext && g_overlayPresent1Next && OverlayHooks(presentCode, (void*)OverlayPresent) &&
+                OverlayHooks(present1Code, (void*)OverlayPresent1);
+            printf("  overlay: Present's code %s\n", cut ? "hooked over the editor's, as RivaTuner does" : "NOT hooked over (the editor's hooks not found)");
+            if (!cut) { puts("FAIL the editor's hooks on Present's code were not where the test looked"); failures++; }
+        }
+        if (frame == 30 || frame == 260 || frame == 300) SendMessageW(window, WM_KEYDOWN, VK_F8, 0);     /* open, close, open */
+        /* closed: a friend's lobby refuses this game's join, and the editor shows why over the "game" (its top centre) */
+        if (frame == 264)
+        {
+            background = screenshot(L"");
+            g_noticeNow.version = 1;
+            g_noticeNow.kind = HF_NOTICE_ERROR;
+            snprintf(g_noticeNow.title, sizeof g_noticeNow.title, "COULDN'T JOIN FRIEND HOST");
+            snprintf(g_noticeNow.text, sizeof g_noticeNow.text, "Your gameplay mods don't match the host's.\nMissing: Stratagem Compendium 1.2.0 "
+                "(the host has it)\nSmarter Guard Dogs & Sentries: you have 5.2.0, the host has 5.1.0\nTurn on the same gameplay mods on the "
+                "launcher's MODS page, then start a new session.");
+            noticeAt = GetTickCount64();
+        }
+        /* the editor reads the notice every 250 ms, and on a fast display the 26 frames to the screenshot take less */
+        if (frame == 288) while (GetTickCount64() - noticeAt < 300) Sleep(10);
+        if (frame == 290)
+        {
+            RECT top = {(LONG)width / 2 - 200, 30, (LONG)width / 2 + 200, 110};
+            const auto pixels = screenshot(ShotPath(shot, L"-notice.bmp"));
+            int drawn = ChangedPixels(pixels, background, width, height, top);
+            printf("  notice: %d of %d pixels at the top centre differ from the background (the editor closed)\n", drawn, 400 * 80);
+            if (drawn < 2000) { puts("FAIL the refused join's message is not on screen while the editor is closed"); failures++; }
+        }
+        /* the host's side: a friend couldn't join, a small note in the top right corner */
+        if (frame == 291)
+        {
+            g_noticeNow.version = 2;
+            g_noticeNow.kind = HF_NOTICE_BRIEF;
+            snprintf(g_noticeNow.title, sizeof g_noticeNow.title, "Friend Joiner couldn't join");
+            snprintf(g_noticeNow.text, sizeof g_noticeNow.text, "Their gameplay mods don't match yours.\nMissing: Stratagem Compendium 1.2.0");
+            noticeAt = GetTickCount64();
+        }
+        if (frame == 296) while (GetTickCount64() - noticeAt < 300) Sleep(10);
+        if (frame == 297)
+        {
+            // The top-centre notice can extend into the first part of the top-right quarter.
+            RECT corner = {(LONG)width - 200, 30, (LONG)width - 40, 70};
+            const auto pixels = screenshot(ShotPath(shot, L"-brief.bmp"));
+            int drawn = ChangedPixels(pixels, background, width, height, corner);
+            printf("  brief notice: %d of %d pixels in the top right corner differ from the background\n", drawn, 160 * 40);
+            if (drawn < 2000) { puts("FAIL the host's brief notice is not in the top right corner"); failures++; }
+        }
+        /* to the objects, the next one back, to its fields, three rows down (past the category header, the projectile swap
+         * and the part header), 1200, F9 */
+        if (frame == 320 || frame == 330) Key(window, VK_TAB);
+        if (frame == 324) Key(window, VK_DOWN);
+        if (frame == 326) Key(window, VK_UP);
+        /* headers start closed: Right opens the category, Down past the projectile swap to the Flight header, Right opens
+         * it, Down to its first row */
+        if (frame == 332 || frame == 338) Key(window, VK_RIGHT);
+        if (frame == 334 || frame == 336 || frame == 340) Key(window, VK_DOWN);
+        if (frame == 342) Type(window, "1200");
+        if (frame == 350) Key(window, VK_RETURN);
+        if (frame == 356) Key(window, VK_F9);
+        if (g_modsView && (frame == 362 || frame == 366 || frame == 370)) Key(window, VK_F6); /* BROWSE, SEARCH, CHANGES, MODS */
+        if (frame == 150 || frame == 200) /* the game resizes its swap chain */
+        {
+            if (!d3d11) { fence->SetEventOnCompletion(value, event); queue->Signal(fence, ++value); WaitForSingleObject(event, 2000); }
+            width = frame == 150 ? 1600 : 1280; height = frame == 150 ? 900 : 720;
+            SetWindowPos(window, NULL, 0, 0, (int)width, (int)height, SWP_NOZORDER);
+            if (FAILED(chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) { puts("FAIL ResizeBuffers"); failures++; }
+        }
+        const float color[4] = {0.05f, 0.25f, 0.05f, 1.0f}; /* green: what the "game" draws */
+        if (d3d11)
+        {
+            ID3D11Texture2D* back = NULL;
+            ID3D11RenderTargetView* view = NULL;
+            chain->GetBuffer(0, IID_PPV_ARGS(&back));
+            if (back && SUCCEEDED(device11->CreateRenderTargetView(back, NULL, &view)))
+            {
+                context11->OMSetRenderTargets(1, &view, NULL);
+                context11->ClearRenderTargetView(view, color);
+                view->Release();
+            }
+            if (back) back->Release();
+            const bool sampleScRgb = checkScRgb && frame == 100;
+            // Keep buffer 0 available after drawing, regardless of which overlay ran during Present.
+            HRESULT presented = chain->Present(1, sampleScRgb ? DXGI_PRESENT_DO_NOT_SEQUENCE : 0);
+            if (FAILED(presented)) { printf("FAIL Present 0x%08lx at frame %d\n", (unsigned long)presented, frame); failures++; }
+            if (sampleScRgb && (presented != S_OK || !CheckScRgbAccent(chain)))
+            {
+                puts("FAIL scRGB FP16: no 200 nits linear accent found in the D3D11 back buffer");
+                failures++;
+            }
+        }
+        UINT index = chain->GetCurrentBackBufferIndex();
+        ID3D12Resource* buffer = NULL;
+        if (!d3d11)
+        {
+        chain->GetBuffer(index, IID_PPV_ARGS(&buffer));
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += index * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        device->CreateRenderTargetView(buffer, NULL, handle);
+        allocator->Reset(); list->Reset(allocator, NULL);
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource = buffer;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        list->ResourceBarrier(1, &barrier);
+        list->ClearRenderTargetView(handle, color, 0, NULL);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        list->ResourceBarrier(1, &barrier);
+        list->Close();
+        ID3D12CommandList* lists[] = {list};
+        overlay(); /* the overlay's queue first, and last before the present */
+        queue->ExecuteCommandLists(1, lists);
+        overlay();
+        HRESULT presented = chain->Present(1, 0);
+        if (FAILED(presented)) { printf("FAIL Present 0x%08lx at frame %d\n", (unsigned long)presented, frame); failures++; }
+        queue->Signal(fence, ++value);
+        fence->SetEventOnCompletion(value, event); WaitForSingleObject(event, 2000);
+        buffer->Release();
+        }
+        if (frame == 400 && argc > 2) /* the screen as it is, editor open */
+        {
+            const auto pixels = screenshot(shot);
+            if (pixels.empty() || background.empty()) continue;
+            if (pixels.size() != background.size())
+            {
+                puts("FAIL editor frame and background dimensions differ");
+                failures++;
+                continue;
+            }
+            const RECT editorArea = {80, 80, 400, 200};
+            int drawn = ChangedPixels(pixels, background, width, height, editorArea);
+            printf("  screen: %d of %d pixels in the editor's area differ from the background\n", drawn, 120 * 320);
+            if (drawn < 1000) { puts("FAIL the editor's window is not on screen"); failures++; }
+            /* HELLFORGE_EDITOR_HDR=pq:200 (Build-Editor's HDR run): the editor's colours come out PQ-encoded at 200 nits.
+             * On an SDR desktop the 10-bit values show as they are, so the area's most common colour that is not the clear
+             * colour is a panel colour (PANEL, PANEL_ALT, HEADER) in PQ: linear, Rec.2020, 200 / 10000, PQ. */
+            if (hdr != NULL && strcmp(hdr, "pq:200") == 0)
+            {
+                std::map<uint32_t, int> counts;
+                const DWORD row = BitmapStride(width);
+                for (LONG y = editorArea.top; y < editorArea.bottom; y++) for (LONG x = editorArea.left; x < editorArea.right; x++)
+                {
+                    const size_t offset = y * row + x * 3;
+                    const BYTE* p = pixels.data() + offset;
+                    if (!IsClearPixel(p, background.data() + offset)) counts[(uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0]]++;
+                }
+                uint32_t common = 0; int most = 0;
+                for (auto& c : counts) if (c.second > most) { most = c.second; common = c.first; }
+                int r = (int)(common >> 16), g = (int)(common >> 8 & 0xFF), b = (int)(common & 0xFF);
+                auto pq = [](double l) { double p = pow(l > 0 ? l : 0, 0.1593017578125); return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375); };
+                const int panels[3][3] = {{24, 27, 32}, {29, 32, 38}, {17, 19, 23}};
+                bool matched = false;
+                for (auto& c : panels)
+                {
+                    double l[3] = {LinearSrgb(c[0]), LinearSrgb(c[1]), LinearSrgb(c[2])};
+                    double m[3] = {0.6274 * l[0] + 0.3293 * l[1] + 0.0433 * l[2], 0.0691 * l[0] + 0.9195 * l[1] + 0.0114 * l[2],
+                                   0.0164 * l[0] + 0.0880 * l[1] + 0.8956 * l[2]};
+                    int e[3] = {(int)(pq(m[0] * 0.02) * 255 + 0.5), (int)(pq(m[1] * 0.02) * 255 + 0.5), (int)(pq(m[2] * 0.02) * 255 + 0.5)};
+                    if (abs(r - e[0]) <= 6 && abs(g - e[1]) <= 6 && abs(b - e[2]) <= 6) matched = true;
+                }
+                printf("  HDR10 (PQ, 200 nits): the editor's most common colour (%d, %d, %d), %d pixels; SDR's panel is (29, 32, 38)\n", r, g, b, most);
+                if (!matched) { puts("FAIL the editor's colours are not PQ-encoded at 200 nits"); failures++; }
+            }
+        }
+    }
+    /* HELLFORGE_EDITOR_TEST_VIEW=enemies, a screenshot only: an Illuminate enemy found in the SEARCH view (F6 from BROWSE)
+     * and opened in its category, with the faction emblems on the category, the rows and the header; the run ends there */
+    if (g_enemiesView && catalogued && argc > 2)
+    {
+        auto pump = [&](int n) {
+            for (int i = 0; i < n; i++)
+            {
+                PumpMessages(window);
+                chain->Present(1, 0);
+            }
+        };
+        Key(window, VK_F6); pump(4);
+        /* HELLFORGE_EDITOR_TEST_SEARCH: another entity to open (a structure, say) */
+        Type(window, getenv("HELLFORGE_EDITOR_TEST_SEARCH") ? getenv("HELLFORGE_EDITOR_TEST_SEARCH") : "overseer"); pump(6);
+        /* the enemy opened with its hundreds of fields, then two seconds of frames: with a slow get_live
+         * (HELLFORGE_EDITOR_TEST_LIVE_US), none may stall */
+        if (const char* cost = getenv("HELLFORGE_EDITOR_TEST_LIVE_US")) g_liveCostUs = atoll(cost);
+        Key(window, VK_RETURN);
+        LARGE_INTEGER f, before, after;
+        QueryPerformanceFrequency(&f);
+        double longest = 0;
+        int slow = 0;
+        for (int i = 0; i < 120; i++)
+        {
+            QueryPerformanceCounter(&before);
+            pump(1);
+            QueryPerformanceCounter(&after);
+            double ms = (double)(after.QuadPart - before.QuadPart) * 1000.0 / (double)f.QuadPart;
+            longest = ms > longest ? ms : longest;
+            slow += ms > 50;
+        }
+        printf("  enemies view: get_live %lld us; 120 frames, the longest %.0f ms, %d over 50 ms\n", g_liveCostUs, longest, slow);
+        if (g_liveCostUs > 0 && longest > 100) { puts("FAIL an enemy's page stalls the frame with a slow get_live"); failures++; }
+        g_liveCostUs = 0;
+        /* HELLFORGE_EDITOR_TEST_EXPAND=1: its page's first header opened (Tab to the fields, Right), for its rows */
+        if (getenv("HELLFORGE_EDITOR_TEST_EXPAND")) { Key(window, VK_TAB); pump(4); Key(window, VK_RIGHT); pump(10); }
+        const std::wstring enemyShot = ShotPath(shot, L"-enemies.bmp");
+        screenshot(enemyShot);
+        printf("%s overlay: the enemies view's screenshot (%s)\n", failures ? "FAIL" : "PASS", hfjson::Utf8(enemyShot).c_str());
+        return failures ? 1 : 0;
+    }
+    /* the change: applied through set_live, then saved into Local Stats (a second after it, from a frame) */
+    if (catalogued)
+    {
+        bool saved = false;
+        for (int wait = 0; wait < 60 && !saved; wait++)
+        {
+            chain->Present(1, 0);
+            FILE* file = _wfopen(stats.c_str(), L"rb");
+            char text[4096] = {};
+            if (file) { fread(text, 1, sizeof text - 1, file); fclose(file); saved = strstr(text, ": 1200") != NULL; }
+            if (!saved) Sleep(50);
+        }
+        printf("  applied: set_live %d time(s), last %.0f; Local Stats %s\n", g_lives, g_lastLive, saved ? "holds 1200" : "does not hold it");
+        if (g_lives < 1 || g_lastLive != 1200) { puts("FAIL the change did not reach set_live"); failures++; }
+        if (!saved) { puts("FAIL Local Stats does not hold the change"); failures++; }
+        /* Del stages the field's reset (nothing written yet), F9 applies it: the base back, and the field out of Local Stats */
+        auto frames = [&](int n) {
+            for (int i = 0; i < n; i++)
+            {
+                PumpMessages(window);
+                chain->Present(1, 0);
+            }
+        };
+        /* the MOD SYNC prompt takes answers a second after it appears or changes state: frames for that long, whatever the
+         * display's rate */
+        auto armed = [&]() { ULONGLONG from = GetTickCount64(); while (GetTickCount64() - from < 1200) frames(1); };
+        Key(window, VK_DELETE);
+        frames(10);
+        int staged = g_resets;
+        Key(window, VK_F9);
+        frames(10);
+        bool gone = false;
+        for (int wait = 0; wait < 60 && !gone; wait++)
+        {
+            frames(1);
+            gone = GetFileAttributesW(stats.c_str()) == INVALID_FILE_ATTRIBUTES;
+            if (!gone) Sleep(50);
+        }
+        printf("  reset: staged without writing %s, applied %d reset(s); Local Stats %s\n", staged == 0 ? "yes" : "NO", g_resets,
+            gone ? "no longer holds it (the mod is gone)" : "still holds it");
+        if (staged != 0 || g_resets < 1) { puts("FAIL the reset was not staged, then applied"); failures++; }
+        if (!gone) { puts("FAIL Local Stats still holds the reset field"); failures++; }
+        /* the projectile swap (two rows up): its picker, filtered, a donor staged (the weapon's own rows locked), applied */
+        Key(window, VK_UP); frames(4);
+        Key(window, VK_UP); frames(4);
+        Key(window, VK_RETURN); frames(10);
+        if (*shot) screenshot(ShotPath(shot, L"-picker.bmp"));
+        Type(window, "eagle");
+        frames(6);
+        Key(window, VK_DOWN); frames(4);
+        Key(window, VK_RETURN); frames(10);
+        if (*shot) screenshot(ShotPath(shot, L"-swapped.bmp"));
+        int before = g_lives;
+        Key(window, VK_F9); frames(10);
+        printf("  swap: set_live %d time(s), last %.0f\n", g_lives - before, g_lastLive);
+        if (g_lives - before != 1 || g_lastLive == 600 || g_lastLive == 1200 || g_lastLive < 1)
+        { puts("FAIL the projectile swap did not reach set_live with a donor"); failures++; }
+        Key(window, VK_DELETE); frames(10);
+        Key(window, VK_F9); frames(20);
+        /* a preset (HD2R Editor's format) imported from the PRESETS view (F6 x4): a number, unlimited uses, no impact
+         * explosion, a status and an enemy's health staged; another status refused */
+        {
+            const std::wstring presets = folder + L"\\presets";
+            CreateDirectoryW(presets.c_str(), NULL);
+            const std::wstring preset = presets + L"\\test.hd2rpreset.json";
+            const std::string prefix = "{\"format\":\"hd2r-editor-preset\",\"version\":1,\"name\":\"Overlay test\","
+                "\"editor\":\"1.0.0\",\"runtime\":\"0.40.0\",\"fields\":[";
+            const std::string sample = prefix +
+                "{\"key\":\"pw|AR-11 Arbitrator|damage.durable_damage\",\"value\":41},"
+                "{\"key\":\"st|Orbital Precision Strike|stratagem:orbital_precision_strike:orbital_precision_strike_stratagem:stratagem.max_uses\",\"value\":\"unlimited\"},"
+                "{\"key\":\"pw|R-36 Eruptor|terminal.primary.impact.explosion\",\"value\":{\"ref\":\"none\"}},"
+                "{\"key\":\"pw|R-36 Eruptor|damage.status_1_type\",\"value\":\"fire\"},"
+                "{\"key\":\"pw|R-36 Eruptor|damage.status_2_type\",\"value\":\"pure_damage\"},"
+                "{\"key\":\"en|Bile Titan|entity::entity.health\",\"value\":7000},"
+                "{\"key\":\"en|fixture unmapped enemy|health\",\"value\":1},"
+                "{\"key\":\"ve|fixture unmapped vehicle|health\",\"value\":1},"
+                "{\"key\":\"zz|fixture unknown family|health\",\"value\":1}]}";
+            if (!hfjson::WriteAtomically(preset, sample)) { puts("FAIL could not write the preset fixture"); return 1; }
+            for (int i = 0; i < 4; i++) { Key(window, VK_F6); frames(4); }
+
+            const struct { const char* field; const char* reason; } bounds[] = {
+                {"{\"key\":\"ve|EXO-55 Breakthrough Exosuit|vw:left_gun|entity.health\",\"value\":-1}", "Must be at least 1."},
+                {"{\"key\":\"pw|AR-11 Arbitrator|magazine.capacity\",\"value\":2048}", "Must be at most 2047."},
+            };
+            for (const auto& bound : bounds)
+            {
+                if (!hfjson::WriteAtomically(preset, prefix + bound.field + "]}")) { puts("FAIL could not write the bound fixture"); return 1; }
+                g_presetSummary.clear();
+                Key(window, VK_RETURN); frames(10);
+                bool refused = g_presetSummary.find("0 staged (APPLY writes them), 1 refused (") != std::string::npos &&
+                    g_presetSummary.find(bound.reason) != std::string::npos;
+                printf("%s preset single bound: %s\n", refused ? "PASS" : "FAIL", bound.reason);
+                if (!refused) failures++;
+            }
+            if (!hfjson::WriteAtomically(preset, sample)) { puts("FAIL could not restore the preset fixture"); return 1; }
+            g_presetSummary.clear();
+            Key(window, VK_RETURN); frames(10);
+            bool skipped = g_presetSummary.find("3 with no HellForge row yet (enemies 1, vehicles 1, zz 1)") != std::string::npos;
+            printf("%s preset skipped families: original categories and counts in log\n", skipped ? "PASS" : "FAIL");
+            if (!skipped) failures++;
+            if (*shot) screenshot(ShotPath(shot, L"-presets.bmp"));
+            int lives = g_lives;
+            Key(window, VK_F9); frames(20);
+            bool saved = false;
+            char text[8192] = {};
+            for (int wait = 0; wait < 60 && !saved; wait++)
+            {
+                frames(1);
+                FILE* in = _wfopen(stats.c_str(), L"rb");
+                if (in) { fread(text, 1, sizeof text - 1, in); fclose(in); }
+                saved = strstr(text, "\"stratagem.max_uses\": -1") && strstr(text, "\"terminal.primary.impact.explosion\": 0") &&
+                    strstr(text, "\"damage.status_1_type\": 5") && strstr(text, "\"damage.durable_damage\": 41") &&
+                    strstr(text, "\"entity::entity.health\": 7000"); /* an enemy's row (the HD2R Editor's Enemies pages) */
+                if (!saved) Sleep(50);
+            }
+            printf("  preset: set_live %d time(s); Local Stats %s\n", g_lives - lives, saved ? "holds the five values" : "does not hold them");
+            if (g_lives - lives != 5 || !saved) { puts("FAIL the preset's five values (an enemy's among them) were not staged and applied"); failures++; }
+
+            /* Export the applied sample from the Presets header and read the original field key and value. */
+            if (!scale)
+            {
+                float unit = (float)height / 1080.0f;
+                float ox = ((float)width / unit - 1260) / 2, oy = (1080 - 930) / 2.0f;
+                LPARAM exportAt = MAKELPARAM((int)((ox + 1165) * unit), (int)((oy + 91) * unit));
+                SendMessageW(window, WM_MOUSEMOVE, 0, exportAt); frames(3);
+                SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, exportAt); frames(2);
+                SendMessageW(window, WM_LBUTTONUP, 0, exportAt); frames(8);
+                WIN32_FIND_DATAW found{};
+                HANDLE query = FindFirstFileW((presets + L"\\HellForge *.hd2rpreset.json").c_str(), &found);
+                bool keyAndValue = false;
+                if (query != INVALID_HANDLE_VALUE)
+                {
+                    FindClose(query);
+                    std::string bytes;
+                    hfjson::Value result;
+                    keyAndValue = hfjson::ReadFile(presets + L"\\" + found.cFileName, &bytes) &&
+                        hfjson::Parse(bytes, &result, nullptr) && HasPresetSample(result);
+                }
+                printf("%s preset export: original damage key and value 41\n", keyAndValue ? "PASS" : "FAIL");
+                if (!keyAndValue) failures++;
+            }
+            Key(window, VK_F6); frames(4); /* LOGS */
+            Key(window, VK_F6); frames(4); /* SETTINGS */
+            Key(window, VK_F6); frames(4); /* BROWSE */
+        }
+        /* the stratagems: back to the categories, down to Offensive (past Secondary and Throwables), a screenshot */
+        if (argc > 2)
+        {
+            Key(window, VK_TAB);
+            frames(4);
+            for (int i = 0; i < 3; i++) { Key(window, VK_DOWN); frames(4); }
+            frames(20);
+            screenshot(ShotPath(shot, L"-stratagems.bmp"));
+            /* Defensive: the mod's stratagem, last in the list (its own icon), its page with its first category open */
+            Key(window, VK_DOWN); frames(4);
+            Key(window, VK_TAB); frames(4);
+            for (int i = 0; i < 6; i++) { Key(window, VK_NEXT); frames(4); }
+            Key(window, VK_TAB); frames(4);
+            Key(window, VK_RIGHT); frames(20);
+            screenshot(ShotPath(shot, L"-mod.bmp"));
+            Key(window, VK_TAB); frames(4); /* back to the categories, at Defensive */
+            /* Vehicles (past Support Weapons, Support Backpacks): the Patriot, its swapped left gun's stats in the left
+             * gun's category, below Mounted Weapons */
+            for (int i = 0; i < 3; i++) { Key(window, VK_DOWN); frames(4); }
+            Key(window, VK_TAB); frames(4);
+            Key(window, VK_TAB); frames(20);
+            screenshot(ShotPath(shot, L"-vehicle.bmp"));
+            Key(window, VK_TAB); frames(4); /* back to the categories, at Vehicles */
+            /* the Helldiver (past Defensive, Support Weapons, Support Backpacks, Vehicles, Mission and Boosters): its armor
+             * perks, the armor passive's picker open */
+            for (int i = 0; i < 3; i++) { Key(window, VK_DOWN); frames(4); } /* Mission, Boosters, Helldiver */
+            Key(window, VK_TAB); frames(4);
+            Key(window, VK_DOWN); frames(4);   /* past the Helldiver's page, to its armor perks */
+            Key(window, VK_TAB); frames(4);
+            Key(window, VK_RIGHT); frames(4);  /* its header open (headers start closed) */
+            Key(window, VK_DOWN); frames(4);
+            Key(window, VK_RETURN); frames(20);
+            screenshot(ShotPath(shot, L"-helldiver.bmp"));
+            Key(window, VK_ESCAPE); frames(4);
+        }
+        /* a big preset (HF_TEST_BIG_PRESET: HD2R Editor's Black Wolfs balance, ~1900 fields) imported: thousands of pending
+         * changes must not slow the editor (frames timed without vsync in PRESETS, CHANGES and BROWSE) */
+        const wchar_t* big = _wgetenv(L"HF_TEST_BIG_PRESET");
+        if (big != NULL && big[0])
+        {
+            const std::wstring target = folder + L"\\presets\\big.hd2rpreset.json";
+            if (CopyFileW(big, target.c_str(), FALSE))
+            {
+                auto timed = [&](const char* where) {
+                    LARGE_INTEGER f, a, b;
+                    QueryPerformanceFrequency(&f);
+                    for (int i = 0; i < 5; i++) { PumpMessages(window); chain->Present(0, 0); }
+                    QueryPerformanceCounter(&a);
+                    for (int i = 0; i < 60; i++) { PumpMessages(window); chain->Present(0, 0); }
+                    QueryPerformanceCounter(&b);
+                    double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart / 60.0;
+                    printf("  big preset: %.1f ms a frame in %s\n", ms, where);
+                    if (ms > 50) { printf("FAIL the editor is slow with a big preset in %s\n", where); failures++; }
+                };
+                for (int i = 0; i < 4; i++) { Key(window, VK_F6); frames(4); }   /* PRESETS (big.hd2rpreset.json first) */
+                Key(window, VK_HOME); frames(2);
+                Key(window, VK_RETURN); frames(4);
+                timed("PRESETS");
+                for (int i = 0; i < 5; i++) { Key(window, VK_F6); frames(2); }   /* LOGS, SETTINGS, BROWSE, SEARCH, CHANGES */
+                timed("CHANGES");
+                /* fields applied at boot among them (attachments, boosters): read through get_stat, not left blank */
+                printf("  get_stat: %d read(s)\n", g_stats);
+                if (g_stats == 0) { puts("FAIL no field applied at boot was read through get_stat"); failures++; }
+                for (int i = 0; i < 5; i++) { Key(window, VK_F6); frames(2); }   /* MODS, PRESETS, LOGS, SETTINGS, BROWSE */
+                timed("BROWSE");
+                /* applied, with refusals: the ERRORS chip opens the errors list; then the LOGS view */
+                g_logsFolder = hfjson::Utf8(mods);
+                FILE* log = _wfopen((mods + L"\\modloader.log").c_str(), L"wb");
+                if (!log) { puts("FAIL could not write the modloader log fixture"); return 1; }
+                fputs("10:00:00.000 HellForge mod loader, SDK 6: 9 code mod(s)\n10:00:01.000 conflict: a and b both change X\n"
+                      "10:00:02.000 stats x: refused: the record is not as reviewed\n10:00:03.000 entity data ready\n", log);
+                fclose(log);
+                g_refuseCapacity = 1;
+                Key(window, VK_F9); frames(20);
+                g_refuseCapacity = 0;
+                float unit = (float)height / 1080.0f, ox = ((float)width / unit - 1260) / 2, oy = (1080 - 930) / 2.0f;
+                LPARAM at = MAKELPARAM((int)((ox + 1260 - 62 - 50) * unit), (int)((oy + 29) * unit));
+                SendMessageW(window, WM_MOUSEMOVE, 0, at); frames(3);
+                SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, at); frames(2);
+                SendMessageW(window, WM_LBUTTONUP, 0, at); frames(10);
+                if (*shot) screenshot(ShotPath(shot, L"-errors.bmp"));
+                Key(window, VK_ESCAPE); frames(4);
+                for (int i = 0; i < 5; i++) { Key(window, VK_F6); frames(3); } /* SEARCH, CHANGES, MODS, PRESETS, LOGS */
+                frames(10);
+                if (*shot) screenshot(ShotPath(shot, L"-logs.bmp"));
+                /* joined to a friend's lobby: the editor is greyed and read-only (a preset import or APPLY changes nothing), and
+                 * the mod stratagem's cooldown is the host's (host-mod-stats.json, which the session's backend writes) */
+                const std::wstring hostMods = folder + L"\\host-mod-stats.json";
+                if (FILE* file = _wfopen(hostMods.c_str(), L"wb"))
+                {
+                    fputs("{\"format\":1,\"mod:test/mod/hmg\":{\"test/mod/hmg\":{\"stratagem.cooldown\":90}}}", file);
+                    fclose(file);
+                }
+                g_sessionNow.role = HF_SESSION_JOINER; g_sessionNow.version = 1; snprintf(g_sessionNow.host, sizeof g_sessionNow.host, "Friend Host");
+                for (int i = 0; i < 2; i++) { Key(window, VK_F6); frames(3); } /* SETTINGS, BROWSE */
+                frames(10);
+                if (*shot) screenshot(ShotPath(shot, L"-readonly.bmp"));
+                for (int i = 0; i < 4; i++) { Key(window, VK_F6); frames(3); } /* SEARCH, CHANGES, MODS, PRESETS */
+                int imports = g_presetImports, writes = g_lives;
+                Key(window, VK_HOME); frames(2); Key(window, VK_RETURN); frames(6); Key(window, VK_F9); frames(6);
+                printf("  read-only: %d import(s), %d write(s) while joined\n", g_presetImports - imports, g_lives - writes);
+                if (g_presetImports != imports || g_lives != writes) { puts("FAIL a joined editor changed something"); failures++; }
+                double joined = g_modCooldown;
+                g_sessionNow.role = HF_SESSION_SOLO; g_sessionNow.version = 2; g_sessionNow.host[0] = 0;
+                DeleteFileW(hostMods.c_str());
+                frames(30);
+                printf("  co-op mod values: the mod stratagem's cooldown %.0f while joined (the host's 90), %.0f after (its own 150)\n", joined, g_modCooldown);
+                if (joined != 90 || g_modCooldown != 150) { puts("FAIL the mod content values did not follow the co-op role"); failures++; }
+                /* joined to a host who lets every player keep their own stats (SDK 15 stats_source, the default): the editor
+                 * stays editable (a preset import stages), and a host's file left beside it is not applied */
+                if (FILE* file = _wfopen(hostMods.c_str(), L"wb"))
+                {
+                    fputs("{\"format\":1,\"mod:test/mod/hmg\":{\"test/mod/hmg\":{\"stratagem.cooldown\":90}}}", file);
+                    fclose(file);
+                }
+                g_statsNow = HF_STATS_OWN;
+                g_sessionNow.role = HF_SESSION_JOINER; g_sessionNow.version = 3; snprintf(g_sessionNow.host, sizeof g_sessionNow.host, "Friend Host");
+                frames(30);
+                imports = g_presetImports;
+                Key(window, VK_HOME); frames(2); Key(window, VK_RETURN); frames(6);
+                printf("  own stats while joined: %d import(s), the mod stratagem's cooldown %.0f (its own 150)\n", g_presetImports - imports, g_modCooldown);
+                if (g_presetImports == imports) { puts("FAIL a joined editor keeping its own stats refused an import"); failures++; }
+                if (g_modCooldown != 150) { puts("FAIL a joined editor keeping its own stats took the host's values"); failures++; }
+                Key(window, VK_ESCAPE); frames(2);
+                g_statsNow = HF_STATS_HOST;
+                g_sessionNow.role = HF_SESSION_SOLO; g_sessionNow.version = 4; g_sessionNow.host[0] = 0;
+                DeleteFileW(hostMods.c_str());
+                frames(10);
+            }
+        }
+        /* mod sync (SDK 14): the offer is read at most once every 30 frames; one shows its dialog alone over the game, the
+         * editor window staying closed. Esc answers no; Enter downloads, and once ready (the prompt back by itself after
+         * Esc hid the download) restarts; B blocks the selected mod; a blocked lobby's OK answers no. The keys reaching
+         * the prompt show it holds the game's input. */
+        for (int i = 0; i < 3; i++) { Key(window, VK_ESCAPE); frames(4); } /* the window closed, whatever was open in it */
+        // The one-second arming period starts when the editor polls the new offer.
+        auto syncArmed = [&]() {
+            const int reads = g_syncReads;
+            for (int wait = 0; wait < 30 && g_syncReads == reads; ++wait) frames(1);
+            armed();
+        };
+        int reads = g_syncReads, editorOpens = g_editorOpens;
+        frames(90);
+        int idleReads = g_syncReads - reads;
+        g_syncList[0] = {sizeof(HfSyncMod), HF_SYNC_MOD_DOWNLOAD, HF_SYNC_CLASS_CONTENT, 0, 3u << 20, "friend.tanks", "Tanks", "2.0"};
+        g_syncList[1] = {sizeof(HfSyncMod), HF_SYNC_MOD_MANUAL, HF_SYNC_CLASS_CODE, 0, 200000, "friend.guns", "Guns", "1.1"};
+        g_syncList[2] = {sizeof(HfSyncMod), HF_SYNC_MOD_OFF, HF_SYNC_CLASS_CONTENT, 0, 0, "mine.extra", "My Extra Mod", "1.0"};
+        /* the refused join's notice comes first, as in game; the dialog takes its place (the screenshot shows the dialog alone) */
+        g_noticeNow.version++;
+        g_noticeNow.kind = HF_NOTICE_ERROR;
+        snprintf(g_noticeNow.title, sizeof g_noticeNow.title, "COULDN'T JOIN FRIEND HOST");
+        snprintf(g_noticeNow.text, sizeof g_noticeNow.text, "Your gameplay mods don't match the host's.\nMissing: Tanks 2.0 (the host has it)");
+        frames(20);
+        SyncOffer(HF_SYNC_OFFER, 1, 3u << 20, 0);
+        frames(40);
+        if (*shot) screenshot(ShotPath(shot, L"-sync.bmp"));
+        Key(window, VK_ESCAPE); frames(4);
+        bool declined = g_syncAnswers[HF_SYNC_DECLINE] == 1;
+        g_syncNow.state = HF_SYNC_NONE; frames(40);
+        SyncOffer(HF_SYNC_OFFER, 2, 3u << 20, 0); syncArmed();
+        Key(window, VK_RETURN); frames(4);
+        bool accepted = g_syncAnswers[HF_SYNC_ACCEPT] == 1;
+        SyncOffer(HF_SYNC_DOWNLOADING, 2, 3u << 20, 1u << 20); frames(40);
+        if (*shot) screenshot(ShotPath(shot, L"-sync-progress.bmp"));
+        Key(window, VK_ESCAPE); frames(4); /* hides the window: the download goes on */
+        bool kept = g_syncAnswers[HF_SYNC_DECLINE] == 1;
+        SyncOffer(HF_SYNC_READY, 2, 3u << 20, 3u << 20); g_syncNow.flags = HF_SYNC_LIVE; syncArmed(); /* the running game takes them */
+        if (*shot) screenshot(ShotPath(shot, L"-sync-live.bmp"));
+        Key(window, VK_RETURN); frames(4);
+        bool restarted = g_syncAnswers[HF_SYNC_RESTART] == 1;
+        g_syncNow.flags = 0;
+        SyncOffer(HF_SYNC_OFFER, 3, 3u << 20, 0); syncArmed();
+        Key(window, 'B'); frames(4);
+        bool blocked = g_syncAnswers[HF_SYNC_BLOCK] == 1 && !strcmp(g_syncBlocked, "friend.tanks");
+        SyncOffer(HF_SYNC_BLOCKED, 4, 0, 0); syncArmed();
+        Key(window, VK_RETURN); frames(4);
+        bool acknowledged = g_syncAnswers[HF_SYNC_DECLINE] == 2;
+        g_syncNow.state = HF_SYNC_NONE; frames(40);
+        printf("  mod sync: %d read(s) in 90 idle frames, %d dialog(s) opened; Esc no %s, Enter download %s, Esc while downloading kept it %s, "
+            "ready's Enter restart %s, B block %s (%s), blocked's OK %s\n", idleReads, g_syncOpens, declined ? "yes" : "NO", accepted ? "yes" : "NO",
+            kept ? "yes" : "NO", restarted ? "yes" : "NO", blocked ? "yes" : "NO", g_syncBlocked, acknowledged ? "yes" : "NO");
+        if (idleReads > 3) { puts("FAIL the editor read the mod sync state more than once every 30 frames"); failures++; }
+        if (g_syncOpens != 5 || !declined || !accepted || !kept || !restarted || !blocked || !acknowledged)
+        { puts("FAIL the mod sync dialog did not open or answer as expected"); failures++; }
+        printf("  mod sync prompt: shown alone %d time(s), gone %d, the editor window opened %d time(s)\n", g_syncAlone, g_syncGone,
+            g_editorOpens - editorOpens);
+        /* offer, offer (on through the download until Esc), ready, blocked; v3's offer came while ready's dialog showed */
+        if (g_syncAlone != 4 || g_syncGone != 4 || g_editorOpens != editorOpens)
+        { puts("FAIL the mod sync prompt did not show alone over the game, or the editor window opened behind it"); failures++; }
+        /* TRUST and GET IT: a Steam friend's code mod HellForge has not verified waits for the player's trust. T shows the
+         * warning in the prompt's place; neither a click before it arms nor Enter trusts, Esc goes back to the list; G opens
+         * the selected mod's page (the backend does: the editor only names the mod); a click on TRUST AND DOWNLOAD a second
+         * after the warning appears trusts that mod. The warning is 420 units high, centred: its button's right edge is 186
+         * units in from the right of its 760, its middle 51 up from the bottom. */
+        g_syncList[0] = {sizeof(HfSyncMod), HF_SYNC_MOD_TRUST, HF_SYNC_CLASS_CODE, 0, 200000, "friend.guns", "Guns", "1.1", "https://example.com/guns"};
+        g_syncList[1] = {sizeof(HfSyncMod), HF_SYNC_MOD_MANUAL, HF_SYNC_CLASS_RAW, 0, 0, "other.textures", "Textures", "3", "https://example.com/textures"};
+        g_syncList[2] = {sizeof(HfSyncMod), HF_SYNC_MOD_OFF, HF_SYNC_CLASS_CONTENT, 0, 0, "mine.extra", "My Extra Mod", "1.0", ""};
+        int warnings = g_syncWarnings, declines = g_syncAnswers[HF_SYNC_DECLINE];
+        SyncOffer(HF_SYNC_BLOCKED, 6, 0, 0); syncArmed();
+        if (*shot) screenshot(ShotPath(shot, L"-sync-trust.bmp"));
+        Key(window, 'T'); frames(4);
+        bool warned = g_syncWarnings == warnings + 1;
+        float unit = (float)height / 1080.0f, ox = (float)(int)(((float)width / unit - 1260) / 2 + 0.5f), oy = (1080 - 930) / 2.0f;
+        LPARAM trustAt = MAKELPARAM((int)((ox + 250 + 760 - 206) * unit), (int)((oy + 255 + 420 - 51) * unit));
+        auto click = [&](LPARAM at) {
+            SendMessageW(window, WM_MOUSEMOVE, 0, at); frames(3);
+            SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, at); frames(2);
+            SendMessageW(window, WM_LBUTTONUP, 0, at); frames(4);
+        };
+        click(trustAt);
+        Key(window, VK_RETURN); frames(4);
+        bool unarmed = g_syncAnswers[HF_SYNC_TRUST] == 0;
+        armed();
+        if (*shot) screenshot(ShotPath(shot, L"-sync-warning.bmp"));
+        Key(window, VK_RETURN); frames(4);
+        bool noEnter = g_syncAnswers[HF_SYNC_TRUST] == 0;
+        Key(window, VK_ESCAPE); frames(4);
+        bool back = g_syncAnswers[HF_SYNC_DECLINE] == declines && g_syncAnswers[HF_SYNC_TRUST] == 0;
+        Key(window, 'G'); frames(4);
+        bool opened = g_syncAnswers[HF_SYNC_OPEN] == 1 && !strcmp(g_syncOpened, "friend.guns");
+        Key(window, 'T'); frames(4); armed();
+        click(trustAt);
+        bool trusted = g_syncAnswers[HF_SYNC_TRUST] == 1 && !strcmp(g_syncTrusted, "friend.guns") && g_syncWarnings == warnings + 2;
+        g_syncNow.state = HF_SYNC_NONE; frames(40);
+        printf("  mod sync trust: T warns %s, an early click and Enter do not trust %s/%s, Esc back to the list %s, G opens %s (%s), "
+            "a click after a second trusts %s (%s)\n", warned ? "yes" : "NO", unarmed ? "yes" : "NO", noEnter ? "yes" : "NO", back ? "yes" : "NO",
+            opened ? "yes" : "NO", g_syncOpened, trusted ? "yes" : "NO", g_syncTrusted);
+        if (!warned || !unarmed || !noEnter || !back || !opened || !trusted) { puts("FAIL the mod sync TRUST warning or GET IT did not answer as expected"); failures++; }
+        /* the lobby browser (SDK 16): the terminal's count going up opens it full screen over the game, asking for a list; J leaves
+         * the joinable lobbies (the stranger's goes), Enter opens the selected one's pop-up and Enter again joins it, and the backend's invitation closes it
+         * for the game's. Opened again from the terminal: on the stranger's lobby A shows the warning before Play with
+         * strangers goes on, and only Y turns it on; Q asks for Quick Play; Esc closes it without joining. */
+        g_browseList[0] = {sizeof(HfBrowseLobby), HF_LOBBY_UNJOINABLE, 0, 1, 4, 7, -1, 2, 0, "steam-1", "Stranger One", "It needs mods installed by hand."};
+        g_browseList[1] = {sizeof(HfBrowseLobby), HF_LOBBY_READY, HF_LOBBY_FLAG_FRIEND | HF_LOBBY_FLAG_JOINABLE, 2, 4, 9, 118, 0, 0, "steam-2", "Friend Host", ""};
+        g_browseList[2] = {sizeof(HfBrowseLobby), HF_LOBBY_DOWNLOAD, HF_LOBBY_FLAG_JOINABLE | HF_LOBBY_FLAG_MISSION, 3, 4, 10, 5, 3, 5u << 20, "steam-3", "Modded Host", ""};
+        g_browseList[0].fix = HF_LOBBY_FIX_STRANGERS;
+        g_browseNow.state = HF_BROWSE_READY; g_browseNow.version = 1; g_browseNow.lobbies = 3;
+        frames(40);
+        int refreshes = g_browseRefreshes, lobbiesAlone = g_lobbiesAlone, lobbiesGone = g_lobbiesGone;
+        bool idle = g_lobbiesAlone == lobbiesAlone && refreshes == 0;
+        g_browseNow.terminal = 1; frames(40);
+        bool shown = g_lobbiesAlone == lobbiesAlone + 1 && g_browseRefreshes == refreshes + 1;
+        armed();
+        if (*shot) screenshot(ShotPath(shot, L"-lobbies.bmp"));
+        Key(window, 'J'); frames(4);
+        Key(window, VK_RETURN); frames(4); /* the lobby's pop-up */
+        if (*shot) screenshot(ShotPath(shot, L"-lobby-popup.bmp"));
+        Key(window, VK_RETURN); frames(4);
+        bool joined = g_browseJoins == 1 && !strcmp(g_browseJoined, "steam-2");
+        g_browseNow.state = HF_BROWSE_INVITED; frames(40);
+        bool invited = g_lobbiesGone == lobbiesGone + 1;
+        g_browseNow.state = HF_BROWSE_READY; g_browseNow.version = 2; g_browseNow.terminal = 2; frames(40); armed();
+        Key(window, 'J'); frames(4); /* every lobby again: the stranger's is first */
+        Key(window, VK_UP); Key(window, VK_UP); Key(window, VK_UP); frames(4);
+        Key(window, 'A'); frames(4);
+        bool warnedFirst = g_browseAllowStrangers == 0;
+        if (*shot) screenshot(ShotPath(shot, L"-strangers.bmp"));
+        Key(window, 'Q'); frames(4); /* the warning holds the keys */
+        bool held = g_browseQuick == 0;
+        Key(window, 'Y'); frames(4);
+        bool allowed = g_browseAllowStrangers == 1;
+        Key(window, 'Q'); frames(4);
+        bool quick = g_browseQuick == 1;
+        Key(window, VK_ESCAPE); armed(); /* the screen powers off, then the browser goes */
+        bool escaped = g_lobbiesAlone == lobbiesAlone + 2 && g_lobbiesGone == lobbiesGone + 2 && g_browseJoins == 1 && g_editorOpens == editorOpens;
+        printf("  lobby browser: idle until the terminal %s, the terminal opens it alone %s, J then Enter joins the friend's lobby %s (%s), "
+            "the invitation closes it %s, Esc closes it %s\n", idle ? "yes" : "NO", shown ? "yes" : "NO", joined ? "yes" : "NO", g_browseJoined,
+            invited ? "yes" : "NO", escaped ? "yes" : "NO");
+        printf("  lobby browser: A warns before Play with strangers %s, the warning holds other keys %s, Y turns it on %s, Q asks for Quick Play %s\n",
+            warnedFirst ? "yes" : "NO", held ? "yes" : "NO", allowed ? "yes" : "NO", quick ? "yes" : "NO");
+        if (!idle || !shown || !joined || !invited || !escaped || !warnedFirst || !held || !allowed || !quick)
+        { puts("FAIL the lobby browser did not open, join, warn, quick-join or close as expected"); failures++; }
+        /* claimed by another mod (browse_state's owner): the terminal no longer opens the editor's browser; released, it does */
+        snprintf(g_browseNow.owner, sizeof g_browseNow.owner, "echelon.browser");
+        frames(40);
+        int claimedAlone = g_lobbiesAlone, claimedRefreshes = g_browseRefreshes;
+        g_browseNow.terminal = 3; frames(40);
+        bool stepsAside = g_lobbiesAlone == claimedAlone && g_browseRefreshes == claimedRefreshes;
+        g_browseNow.owner[0] = 0; frames(40);
+        g_browseNow.terminal = 4; frames(40);
+        bool reopened = g_lobbiesAlone == claimedAlone + 1;
+        armed();
+        Key(window, VK_ESCAPE); armed();
+        printf("  lobby browser: claimed by a mod, the terminal leaves it to the mod %s; released, the terminal opens it %s\n",
+            stepsAside ? "yes" : "NO", reopened ? "yes" : "NO");
+        if (!stepsAside || !reopened) { puts("FAIL the editor's lobby browser did not step aside for a mod's claim"); failures++; }
+    }
+    HRESULT removed = d3d11 ? device11->GetDeviceRemovedReason() : device->GetDeviceRemovedReason();
+    if (removed != S_OK) { printf("FAIL device removed 0x%08lx\n", (unsigned long)removed); failures++; }
+    if (!g_hooked || !g_drawing) { puts("FAIL the editor did not hook or start drawing"); failures++; }
+    /* in front of the overlay again, and the overlay still called (after the editor); the method table every swap chain
+     * shares never patched (Steam's overlay hooks whatever it holds, and a table pointing at the editor made it recurse) */
+    printf("  overlay: the editor got in front of it %d time(s); its detour ran %d time(s)\n", g_again, g_overlayPresents);
+    /* (with a real RivaTuner the test's overlay is left out: RivaTuner's own hooks over the editor's are the ones; should
+     * it have hooked before the editor this time, there was nothing to get in front of, and the screenshots still tell) */
+    if (rivaTuner && g_again < 1) puts("  overlay: NOTE RivaTuner did not hook over the editor this time");
+    if (!rivaTuner && (g_again < 1 || g_overlayPresents < 50)) { puts("FAIL the editor did not get in front of the overlay that hooked over it, or cut it out"); failures++; }
+    printf("  overlay: the editor put its own hook back %d time(s)\n", g_putBack);
+    if (!rivaTuner && g_putBack < 1) { puts("FAIL the editor did not put its hook back when the code was put back as it was"); failures++; }
+    if ((*(void***)chain)[8] != presentCode || (*(void***)chain)[22] != present1Code) { puts("FAIL the swap chains' shared method table was patched"); failures++; }
+    if (!d3d11)
+    {
+        printf("  queues: the swap chain's %p, the overlay's %p; the editor draws on %p\n", (void*)queue, (void*)overlayQueue, g_drawnQueue);
+        if (g_drawnQueue != (void*)queue) { puts("FAIL the editor draws on another queue than the swap chain's (the overlay's?)"); failures++; }
+    }
+    printf("%s %soverlay: hooked %d, drawing %d, 420 frames, two resizes, F8 open/close/open, device %s\n", failures ? "FAIL" : "PASS",
+        full ? "full " : "", g_hooked, g_drawing, removed == S_OK ? "healthy" : "removed");
+    return failures ? 1 : 0;
+}
