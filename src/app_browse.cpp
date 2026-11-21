@@ -404,7 +404,7 @@ static void DrawRowItem(const Item& item, const Area& at, bool selected, bool fo
     g_cv.Text(def, x + FX_DEFAULT_RIGHT, cy, T(SZ_SMALL, FAINT, ui::BODY, ui::RIGHT, 84));
     bool error = g_errors.count(row) > 0;
     DrawValueBox(row, v, at, error, locked || blocked);
-    if (!row->unit.empty()) g_cv.Text(row->unit, x + FX_UNIT, cy, T(SZ_TINY, FAINT, ui::BODY, ui::LEFT, 56));
+    if (!row->unit.empty()) g_cv.Text(CatalogText(row->unit), x + FX_UNIT, cy, T(SZ_TINY, FAINT, ui::BODY, ui::LEFT, 56));
     DrawRowBadge(row, v, x + lw + FX_BADGE_RIGHT, cy, error, locked, blocked);
 }
 
@@ -509,7 +509,7 @@ static std::string RangeText(const Row* row)
 static std::string FirstNames(const std::vector<std::string>& of)
 {
     std::string names;
-    for (size_t i = 0; i < of.size() && i < 2; i++) names += (i ? ", " : "") + of[i];
+    for (size_t i = 0; i < of.size() && i < 2; i++) names += (i ? Ui(", ") : "") + CatalogText(of[i]);
     if (of.size() > 2) names += " +" + std::to_string(of.size() - 2);
     return names;
 }
@@ -519,7 +519,7 @@ static std::string AlsoText(const Row* row)
 {
     std::string text = row->also.empty() ? "" : Ui("also changes ") + FirstNames(row->also);
     if (!row->alsoIf.empty())
-        text += (text.empty() ? Ui("also changes ") : Ui("; and ")) + FirstNames(row->alsoIf) + Ui(" when they use ") + row->alsoAmmo;
+        text += (text.empty() ? Ui("also changes ") : Ui("; and ")) + FirstNames(row->alsoIf) + Ui(" when they use ") + CatalogText(row->alsoAmmo);
     return text;
 }
 

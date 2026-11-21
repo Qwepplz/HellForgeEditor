@@ -77,7 +77,7 @@ void DrawChanges(float y0, float h)
         float cy = y + rh / 2;
         DrawIcon(e.row->object, x + 18, y + 4, rh - 8);
         g_cv.Text(ObjectName(e.row->object), x + 18 + rh, cy, T(SZ_SMALL, DIM, ui::BODY, ui::LEFT, 300 - rh));
-        g_cv.Text(FieldLabel(e.row), x + 330, cy, T(SZ_SMALL, TEXT, ui::BODY, ui::LEFT, lw - 330 - 450));
+        g_cv.Text(SummaryFieldLabel(e.row), x + 330, cy, T(SZ_SMALL, TEXT, ui::BODY, ui::LEFT, lw - 330 - 450));
         LiveState& live = Live(e.row);
         g_cv.Text(live.read ? Format(e.row, live.base, true) : "\xE2\x80\x94", x + lw - 420, cy, T(SZ_SMALL, FAINT, ui::BODY, ui::RIGHT, 150));
         g_cv.Text(e.reset && !live.read ? "\xE2\x80\x94" : Format(e.row, e.value, true), x + lw - 250, cy, T(SZ_LABEL, e.state == 1 ? PENDING : GOLD, ui::BODY, ui::RIGHT, 160));
@@ -277,7 +277,7 @@ void DrawErrors()
         float lx = rx + 22;
         if (DrawIcon(row->object, rx + 20, ry + 7, rh - 14, 12)) lx = rx + 26 + rh - 14;
         float nw = g_cv.Text(ObjectName(row->object), lx, ry + 16, T(SZ_SMALL, DIM, ui::BODY, ui::LEFT, (rw - 300 - lx + rx) * 0.45f, 12));
-        g_cv.Text(FieldLabel(row), lx + nw + 12, ry + 16, T(SZ_LABEL, selected ? TEXT : DIM, ui::BODY, ui::LEFT, rw - 300 - (lx - rx) - nw - 12, 12));
+        g_cv.Text(SummaryFieldLabel(row), lx + nw + 12, ry + 16, T(SZ_LABEL, selected ? TEXT : DIM, ui::BODY, ui::LEFT, rw - 300 - (lx - rx) - nw - 12, 12));
         double v;
         const Pend* p = PendingOf(row);
         std::string value = p ? (p->reset ? Ui("reset") : Format(row, p->value, true)) : Saved(row, &v) ? Format(row, v, true) : "\xE2\x80\x94";

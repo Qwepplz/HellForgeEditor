@@ -321,7 +321,7 @@ void DrawMods(float y0, float h)
         float cy = y + rh / 2;
         DrawIcon(row->object, x + 18, y + 4, rh - 8);
         g_cv.Text(ObjectName(row->object), x + 18 + rh, cy, T(SZ_SMALL, DIM, ui::BODY, ui::LEFT, 260 - rh));
-        g_cv.Text(FieldLabel(row), x + 280, cy, T(SZ_SMALL, TEXT, ui::BODY, ui::LEFT, lw - 280 - 330));
+        g_cv.Text(SummaryFieldLabel(row), x + 280, cy, T(SZ_SMALL, TEXT, ui::BODY, ui::LEFT, lw - 280 - 330));
         const LiveState& live = Live(row);
         g_cv.Text(live.read ? Format(row, live.base, true) : "\xE2\x80\x94", x + lw - 170, cy, T(SZ_LABEL, tone, ui::BODY, ui::RIGHT, 150));
         bool yours = live.read && !Same(row, live.now, live.base); /* an editor change over the mod's */

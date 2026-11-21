@@ -153,9 +153,8 @@ static void AddRow(std::vector<Item>& items, const Row* r, int depth, const std:
     AddExplosionViews(items, r, depth, value);
 }
 
-/* The weapon a vehicle weapon's slot holds when it is not the vehicle's own (the category then shows that weapon's
- * stats), else nullptr. */
-static const Row::Option* SwappedWeapon(const catalog::Category& c)
+/* The slot and replacement weapon when a vehicle's category shows the replacement's stats. */
+static std::pair<const Row*, const Row::Option*> SwappedWeapon(const catalog::Category& c)
 {
     for (auto& p : c.parts)
         for (const Row* r : p.rows)
@@ -163,23 +162,24 @@ static const Row::Option* SwappedWeapon(const catalog::Category& c)
             if (r->mountSlot.empty()) continue;
             const Row* slot = g_catalog.Entry("mounts", MountVehicle(r), r->mountSlot);
             if (slot == nullptr || slot->options.empty()) continue;
-            if (const Row::Option* o = slot->OptionOf(ViewOf(slot).value); o != nullptr && o != &slot->options[0]) return o;
+            if (const Row::Option* o = slot->OptionOf(ViewOf(slot).value); o != nullptr && o != &slot->options[0]) return {slot, o};
         }
-    return nullptr;
+    return {};
 }
 
 /* a vehicle weapon's category while its slot holds another weapon: that weapon's stats, editable there */
-static void AddSwappedCategory(std::vector<Item>& items, const catalog::Category& c, const Row::Option* swapped)
+static void AddSwappedCategory(std::vector<Item>& items, const catalog::Category& c, const Row* slot, const Row::Option* swapped)
 {
+    const std::string name = OptionLabel(slot, swapped->label);
     static const std::vector<std::pair<std::string, std::vector<const Row*>>> none;
     auto& sections = swapped->target.empty() ? none : WeaponSections(swapped->target);
     Item h;
-    h.header = h.category = true; h.title = c.title + SEP + swapped->label; h.key = c.key; h.open = IsOpen(c.key);
+    h.header = h.category = true; h.title = CatalogText(c.title) + SEP + name; h.key = c.key; h.open = IsOpen(c.key);
     for (auto& [title, rows] : sections) { h.count += (int)rows.size(); h.rows.insert(h.rows.end(), rows.begin(), rows.end()); }
     h.parts = (int)sections.size();
     items.push_back(h);
     if (!h.open) return;
-    if (sections.empty()) { AddNote(items, swapped->label + Ui(": no page of the editor shows its stats"), 1); return; }
+    if (sections.empty()) { AddNote(items, name + Ui(": no page of the editor shows its stats"), 1); return; }
     for (auto& [title, rows] : sections)
     {
         Item s;
@@ -228,13 +228,13 @@ static std::vector<Item> ItemsNow(const Object* object)
     if (!object->notOffered.empty())
     {
         Item it;
-        it.note = Ui("No projectile swap: ") + object->notOffered;
+        it.note = Ui("No projectile swap: ") + CatalogText(object->notOffered);
         items.push_back(it);
     }
     for (auto& c : object->page)
     {
         if (c.plain) { AddRow(items, c.parts[0].rows[0], 0, c.prefix); continue; }
-        if (const Row::Option* swapped = SwappedWeapon(c)) AddSwappedCategory(items, c, swapped);
+        if (const auto [slot, swapped] = SwappedWeapon(c); swapped) AddSwappedCategory(items, c, slot, swapped);
         else AddCategory(items, c);
     }
     return items;

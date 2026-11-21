@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdint.h>
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <set>
@@ -31,6 +32,8 @@ using ui::TextOpts;
 using zh_cn::Diagnostic;
 using zh_cn::Ui;
 
+const char* const SEP = " \xC2\xB7 ";
+
 inline std::string CatalogText(std::string_view text)
 {
     return zh_cn::Display(zh_cn::Domain::Ui, text, text);
@@ -43,12 +46,54 @@ inline std::string NavigationLabel(const catalog::Nav& nav)
 
 inline std::string ObjectName(const Object* object)
 {
-    return zh_cn::Display(zh_cn::Domain::Item, object->id, object->name);
+    std::string_view original = object->name;
+    if (original == "Sos Beacon")
+    {
+        /* The catalogue uses a single English name for the two SOS resources. */
+        if (object->id == "enemies/content/fac_helldivers/hellpod/landingzone_beacon/sos_beacon")
+            original = "Sos Beacon (Landing Zone)";
+        else if (object->id == "enemies/content/fac_helldivers/hellpod/sos_beacon/sos_beacon")
+            original = "Sos Beacon (Hellpod)";
+    }
+    return zh_cn::Display(zh_cn::Domain::Item, object->id, original);
 }
 
 inline std::string FieldLabel(const Row* row)
 {
     return zh_cn::Display(zh_cn::Domain::Field, row->category + "|" + row->key + "|" + row->label, row->label);
+}
+
+/* Flat summaries use the BROWSE headings to identify armor at different locations. */
+inline std::string SummaryFieldLabel(const Row* row)
+{
+    std::string label = FieldLabel(row);
+    const bool mountArmor = row->label == "Mount armor";
+    const bool zoneArmor = row->label == "Zone armor" ||
+        (row->label == "Armor" &&
+            ((row->category == "vehicles" && row->key.rfind("zone_", 0) == 0) ||
+             (row->category == "enemies" && row->key.rfind("damage_zone:", 0) == 0)));
+    const bool bodyArmor = row->label == "Armor" && row->key == "entity::entity.armor";
+    const bool shieldArmor = row->label == "Armor" && row->component == "ShieldComponentData";
+    if ((!mountArmor && !zoneArmor && !bodyArmor && !shieldArmor) || row->object == nullptr) return label;
+
+    for (const auto& category : row->object->page)
+        for (const auto& part : category.parts)
+        {
+            const auto& title = mountArmor ? category.title : part.title;
+            if (title.empty() || (bodyArmor && title == category.title) ||
+                std::find(part.rows.begin(), part.rows.end(), row) == part.rows.end()) continue;
+
+            std::string context = CatalogText(title);
+            if (bodyArmor)
+            {
+                const std::string commonHeading = SEP + CatalogText(category.title);
+                if (context.size() > commonHeading.size() &&
+                    context.compare(context.size() - commonHeading.size(), commonHeading.size(), commonHeading) == 0)
+                    context.resize(context.size() - commonHeading.size());
+            }
+            return context + SEP + label;
+        }
+    return label;
 }
 
 inline std::string OptionLabel(const Row* row, std::string_view label)
@@ -89,7 +134,6 @@ const float HEADER_H = 58, FOOTER_H = 56, STATUS_H = 40, ROW_H = 30, LIST_ROW_H 
 const float CAT_W = 224, OBJ_W = 334;
 /* Column positions of the field rows (relative to the fields pane). */
 const float FX_LABEL = 18, FX_DEFAULT_RIGHT = 404, FX_BOX = 416, FX_BOX_W = 120, FX_UNIT = 544, FX_BADGE_RIGHT = -14, INDENT = 20;
-const char* const SEP = " \xC2\xB7 ";
 
 inline TextOpts T(float size, ImU32 colour, ui::Face face = ui::BODY, ui::Align align = ui::LEFT, float max = 0, int z = 5)
 {

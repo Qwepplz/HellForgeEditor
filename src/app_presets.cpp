@@ -305,7 +305,7 @@ void ImportPreset(const PresetFile& p)
         std::string refusal;
         if (const Row* row = count.firstRefused)
             refusal = (display ? ObjectName(row->object) : row->object->name) + SEP +
-                (display ? FieldLabel(row) : row->label) + ": " + count.firstWhy.Text(display);
+                (display ? SummaryFieldLabel(row) : row->label) + ": " + count.firstWhy.Text(display);
         return std::to_string(count.staged) + phrase(" staged (APPLY writes them)") +
             (skip ? ", " + std::to_string(skip) + phrase(" with no HellForge row yet (") + families + ")" : "") +
             (count.locked ? ", " + std::to_string(count.locked) + phrase(" for a weapon's own round while the preset swaps it") : "") +

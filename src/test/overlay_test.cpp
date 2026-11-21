@@ -546,19 +546,109 @@ static bool CopyCatalogue(const std::wstring& source, const std::wstring& folder
     return true;
 }
 
-static bool HasPresetSample(const hfjson::Value& root)
+static constexpr char kPatriotName[] = "EXO-45 Patriot Exosuit";
+static constexpr struct
+{
+    const char* category;
+    const char* target;
+    const char* statsKey;
+    const char* presetKey;
+    double value;
+} kArmorSamples[] = {
+    {"vehicles", kPatriotName, "entity.armor", "ve|EXO-45 Patriot Exosuit|vh|vehicle:exo-45-patriot-exosuit:"
+        "exo-45-patriot-exosuit-entity:entity.armor", 3},
+    {"vehicles", kPatriotName, "zone_0.armor", "ve|EXO-45 Patriot Exosuit|vh|vehicle:exo-45-patriot-exosuit:"
+        "exo-45-patriot-exosuit-damage-zone-zone-0:zone.armor", 4},
+    {"vehicles", kPatriotName, "zone_1.armor", "ve|EXO-45 Patriot Exosuit|vh|vehicle:exo-45-patriot-exosuit:"
+        "exo-45-patriot-exosuit-damage-zone-zone-1:zone.armor", 5},
+    {"enemies", "weapon_rack_mini_missile_silo", "entity::entity.armor",
+        "en|weapon_rack_mini_missile_silo|entity::entity.armor", 1},
+    {"enemies", "mini_missile_silo", "entity::entity.armor", "en|mini_missile_silo|entity::entity.armor", 2},
+    {"enemies", "tripod", "entity::entity.armor", "en|tripod|entity::entity.armor", 3},
+    {"enemies", "tripod", "entity::shield.armor", "en|tripod|entity::shield.armor", 4.5},
+    {"backpacks", "SH-20 Ballistic Shield Backpack", "zone.armor",
+        "sb|SH-20 Ballistic Shield Backpack|bp|backpack:sh-20-ballistic-shield-backpack:"
+        "sh-20-ballistic-shield-backpack-damage-zone-zone-0:zone.armor", 6},
+    {"enemies", "ballistic_shield_backpack", "entity::entity.armor",
+        "en|ballistic_shield_backpack|entity::entity.armor", 7},
+    {"enemies", "harvester", "entity::entity.armor", "en|harvester|entity::entity.armor", 4},
+    {"enemies", "content/fac_helldivers/hellpod/landingzone_beacon/sos_beacon", "entity::entity.armor",
+        "en|content/fac_helldivers/hellpod/landingzone_beacon/sos_beacon|entity::entity.armor", 8},
+    {"enemies", "content/fac_helldivers/hellpod/sos_beacon/sos_beacon", "entity::entity.armor",
+        "en|content/fac_helldivers/hellpod/sos_beacon/sos_beacon|entity::entity.armor", 9},
+};
+
+static bool HasLocalStat(const hfjson::Value& root, const char* category, const char* object, const char* key, double expected)
+{
+    const auto* group = root.Find(category, hfjson::Value::Object);
+    const auto* target = group ? group->Find(object, hfjson::Value::Object) : nullptr;
+    const auto* value = target ? target->Find(key, hfjson::Value::Number) : nullptr;
+    return value && value->AsNumber() == expected;
+}
+
+static bool HasSavedPresetSample(const hfjson::Value& root)
+{
+    for (const auto& armor : kArmorSamples)
+        if (!HasLocalStat(root, armor.category, armor.target, armor.statsKey, armor.value)) return false;
+    return HasLocalStat(root, "stratagems", "Orbital Precision Strike", "stratagem.max_uses", -1) &&
+        HasLocalStat(root, "weapons", "R-36 Eruptor", "terminal.primary.impact.explosion", 0) &&
+        HasLocalStat(root, "weapons", "R-36 Eruptor", "damage.status_1_type", 5) &&
+        HasLocalStat(root, "weapons", "AR-11 Arbitrator", "damage.durable_damage", 41) &&
+        HasLocalStat(root, "enemies", "Bile Titan", "entity::entity.health", 7000);
+}
+
+static bool HasPresetNumber(const hfjson::Value& fields, const char* key, double expected)
+{
+    bool found = false;
+    for (const auto& field : fields.items)
+    {
+        if (field.GetString("key") != key) continue;
+        const auto* value = field.Find("value", hfjson::Value::Number);
+        if (found || !value || value->AsNumber() != expected) return false;
+        found = true;
+    }
+    return found;
+}
+
+static bool HasExportedPresetSample(const hfjson::Value& root)
 {
     const auto* fields = root.Find("fields", hfjson::Value::Array);
     if (root.GetString("format") != "hd2r-editor-preset" || !fields) return false;
-    const hfjson::Value* damage = nullptr;
-    for (const auto& field : fields->items)
+    for (const auto& armor : kArmorSamples)
+        if (!HasPresetNumber(*fields, armor.presetKey, armor.value)) return false;
+    return HasPresetNumber(*fields, "pw|AR-11 Arbitrator|damage.durable_damage", 41);
+}
+
+static bool RejectsBadArmorStats(const hfjson::Value& saved)
+{
+    auto wrongTarget = saved;
+    auto& vehicles = wrongTarget.At("vehicles");
+    auto armor = vehicles.At(kPatriotName);
+    vehicles.Erase(kPatriotName);
+    vehicles.At("M-102 Gunner FRV") = std::move(armor);
+    if (HasSavedPresetSample(wrongTarget)) return false;
+
+    auto wrongValues = saved;
+    auto& patriot = wrongValues.At("vehicles").At(kPatriotName);
+    for (const auto& field : kArmorSamples)
+        if (strcmp(field.target, kPatriotName) == 0)
+            patriot.At(field.statsKey) = hfjson::Value::MakeNumber(field.value * 10, true);
+    return !HasSavedPresetSample(wrongValues);
+}
+
+static bool RejectsBadArmorExport(hfjson::Value exported)
+{
+    const auto& armor = kArmorSamples[0];
+    for (auto& field : exported.At("fields").items)
     {
-        if (field.GetString("key") != "pw|AR-11 Arbitrator|damage.durable_damage") continue;
-        if (damage) return false;
-        damage = field.Find("value", hfjson::Value::Number);
-        if (!damage) return false;
+        if (field.GetString("key") != armor.presetKey) continue;
+        field.At("value") = hfjson::Value::MakeNumber(armor.value * 10, true);
+        if (HasExportedPresetSample(exported)) return false;
+        field.At("value") = hfjson::Value::MakeNumber(armor.value, true);
+        field.At("key") = hfjson::Value::MakeString("ve|M-102 Gunner FRV|fixture wrong key");
+        return !HasExportedPresetSample(exported);
     }
-    return damage && damage->AsNumber() == 41;
+    return false;
 }
 
 static void* Record(HfMod*, HfRef, const char*, uint32_t, uint32_t size) /* a Liberator record holding 640 rpm */
@@ -1033,21 +1123,23 @@ int wmain(int argc, wchar_t** argv)
         { puts("FAIL the projectile swap did not reach set_live with a donor"); failures++; }
         Key(window, VK_DELETE); frames(10);
         Key(window, VK_F9); frames(20);
-        /* a preset (HD2R Editor's format) imported from the PRESETS view (F6 x4): a number, unlimited uses, no impact
-         * explosion, a status and an enemy's health staged; another status refused */
+        /* Show the pending armor changes together before applying the HD2R preset. */
         {
             const std::wstring presets = folder + L"\\presets";
             CreateDirectoryW(presets.c_str(), NULL);
             const std::wstring preset = presets + L"\\test.hd2rpreset.json";
             const std::string prefix = "{\"format\":\"hd2r-editor-preset\",\"version\":1,\"name\":\"Overlay test\","
                 "\"editor\":\"1.0.0\",\"runtime\":\"0.40.0\",\"fields\":[";
+            std::string armorFields;
+            for (const auto& armor : kArmorSamples)
+                armorFields += "{\"key\":\"" + std::string(armor.presetKey) + "\",\"value\":" + std::to_string(armor.value) + "},";
             const std::string sample = prefix +
                 "{\"key\":\"pw|AR-11 Arbitrator|damage.durable_damage\",\"value\":41},"
                 "{\"key\":\"st|Orbital Precision Strike|stratagem:orbital_precision_strike:orbital_precision_strike_stratagem:stratagem.max_uses\",\"value\":\"unlimited\"},"
                 "{\"key\":\"pw|R-36 Eruptor|terminal.primary.impact.explosion\",\"value\":{\"ref\":\"none\"}},"
                 "{\"key\":\"pw|R-36 Eruptor|damage.status_1_type\",\"value\":\"fire\"},"
                 "{\"key\":\"pw|R-36 Eruptor|damage.status_2_type\",\"value\":\"pure_damage\"},"
-                "{\"key\":\"en|Bile Titan|entity::entity.health\",\"value\":7000},"
+                "{\"key\":\"en|Bile Titan|entity::entity.health\",\"value\":7000}," + armorFields +
                 "{\"key\":\"en|fixture unmapped enemy|health\",\"value\":1},"
                 "{\"key\":\"ve|fixture unmapped vehicle|health\",\"value\":1},"
                 "{\"key\":\"zz|fixture unknown family|health\",\"value\":1}]}";
@@ -1068,6 +1160,25 @@ int wmain(int argc, wchar_t** argv)
                 printf("%s preset single bound: %s\n", refused ? "PASS" : "FAIL", bound.reason);
                 if (!refused) failures++;
             }
+            const auto captureChanges = [&](const wchar_t* suffix) {
+                if (!*shot) return;
+                for (int i = 0; i < 5; i++) { Key(window, VK_F6); frames(4); } /* CHANGES */
+                screenshot(ShotPath(shot, suffix));
+                for (int i = 0; i < 2; i++) { Key(window, VK_F6); frames(4); } /* PRESETS */
+            };
+            const std::string walkerArmor = prefix +
+                "{\"key\":\"en|combat_walker|entity::entity.armor\",\"value\":6},"
+                "{\"key\":\"en|combat_walker|damage_zone:zone_0:zone.armor\",\"value\":7},"
+                "{\"key\":\"en|combat_walker|damage_zone:zone_1:zone.armor\",\"value\":8}]}";
+            if (!hfjson::WriteAtomically(preset, walkerArmor)) { puts("FAIL could not write the entity armor fixture"); return 1; }
+            g_presetSummary.clear();
+            Key(window, VK_RETURN); frames(10);
+            const bool walkerStaged = g_presetSummary == "editor: preset Overlay test: 3 staged (APPLY writes them)";
+            printf("%s entity armor preset: body and both damage zones staged through combat_walker\n", walkerStaged ? "PASS" : "FAIL");
+            if (!walkerStaged) failures++;
+            captureChanges(L"-entity-armor-changes.bmp");
+
+            /* The Patriot sample replaces the pending entity rows at the same addresses. */
             if (!hfjson::WriteAtomically(preset, sample)) { puts("FAIL could not restore the preset fixture"); return 1; }
             g_presetSummary.clear();
             Key(window, VK_RETURN); frames(10);
@@ -1075,22 +1186,26 @@ int wmain(int argc, wchar_t** argv)
             printf("%s preset skipped families: original categories and counts in log\n", skipped ? "PASS" : "FAIL");
             if (!skipped) failures++;
             if (*shot) screenshot(ShotPath(shot, L"-presets.bmp"));
+            captureChanges(L"-armor-changes.bmp");
             int lives = g_lives;
             Key(window, VK_F9); frames(20);
             bool saved = false;
-            char text[8192] = {};
+            hfjson::Value savedStats;
             for (int wait = 0; wait < 60 && !saved; wait++)
             {
                 frames(1);
-                FILE* in = _wfopen(stats.c_str(), L"rb");
-                if (in) { fread(text, 1, sizeof text - 1, in); fclose(in); }
-                saved = strstr(text, "\"stratagem.max_uses\": -1") && strstr(text, "\"terminal.primary.impact.explosion\": 0") &&
-                    strstr(text, "\"damage.status_1_type\": 5") && strstr(text, "\"damage.durable_damage\": 41") &&
-                    strstr(text, "\"entity::entity.health\": 7000"); /* an enemy's row (the HD2R Editor's Enemies pages) */
+                std::string bytes;
+                saved = hfjson::ReadFile(stats, &bytes) && hfjson::Parse(bytes, &savedStats, nullptr) &&
+                    HasSavedPresetSample(savedStats);
                 if (!saved) Sleep(50);
             }
-            printf("  preset: set_live %d time(s); Local Stats %s\n", g_lives - lives, saved ? "holds the five values" : "does not hold them");
-            if (g_lives - lives != 5 || !saved) { puts("FAIL the preset's five values (an enemy's among them) were not staged and applied"); failures++; }
+            bool applied = g_lives - lives == 17 && saved;
+            printf("%s preset import: set_live %d time(s), Local Stats %s all seventeen exact values at their original targets\n",
+                applied ? "PASS" : "FAIL", g_lives - lives, saved ? "holds" : "does not hold");
+            if (!applied) failures++;
+            const bool rejectedBadStats = saved && RejectsBadArmorStats(savedStats);
+            printf("%s Local Stats checks: reject a wrong vehicle and tenfold armor values\n", rejectedBadStats ? "PASS" : "FAIL");
+            if (!rejectedBadStats) failures++;
 
             /* Export the applied sample from the Presets header and read the original field key and value. */
             if (!scale)
@@ -1104,16 +1219,19 @@ int wmain(int argc, wchar_t** argv)
                 WIN32_FIND_DATAW found{};
                 HANDLE query = FindFirstFileW((presets + L"\\HellForge *.hd2rpreset.json").c_str(), &found);
                 bool keyAndValue = false;
+                hfjson::Value exported;
                 if (query != INVALID_HANDLE_VALUE)
                 {
                     FindClose(query);
                     std::string bytes;
-                    hfjson::Value result;
                     keyAndValue = hfjson::ReadFile(presets + L"\\" + found.cFileName, &bytes) &&
-                        hfjson::Parse(bytes, &result, nullptr) && HasPresetSample(result);
+                        hfjson::Parse(bytes, &exported, nullptr) && HasExportedPresetSample(exported);
                 }
-                printf("%s preset export: original damage key and value 41\n", keyAndValue ? "PASS" : "FAIL");
+                printf("%s preset export: original AR-11 damage and twelve armor keys and exact values\n", keyAndValue ? "PASS" : "FAIL");
                 if (!keyAndValue) failures++;
+                const bool rejectedBadExport = keyAndValue && RejectsBadArmorExport(exported);
+                printf("%s preset export checks: reject a wrong armor key and value\n", rejectedBadExport ? "PASS" : "FAIL");
+                if (!rejectedBadExport) failures++;
             }
             Key(window, VK_F6); frames(4); /* LOGS */
             Key(window, VK_F6); frames(4); /* SETTINGS */
